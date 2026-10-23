@@ -1,6 +1,6 @@
 # Installation and update
 
-Status: current user-local installer. DevCore `1.0.1` passed disposable-HOME clean-install, upgrade, checksum-failure, and rollback checks. TICK-48 installed the published executable through this installer.
+Status: current user-local installer. DevCore `1.1.0` passed disposable-HOME clean-install, upgrade, checksum-failure, and rollback checks. TICK-49 installed the published executable through this installer after fresh-download verification.
 
 ## Requirements
 
@@ -11,17 +11,17 @@ Use Bash, GNU `date` with nanosecond formatting, `flock`, `stat`, `sha256sum`, `
 Download the executable and checksum file from an authorized repository release. Verify the checksum before installation, then pass the exact release version and digest to the installer:
 
 ```sh
-gh release download v1.0.1 --repo JCSchoeman96/devcore-project \
+gh release download v1.1.0 --repo JCSchoeman96/devcore-project \
   --pattern devcore-project --pattern devcore-project.sha256
 sha256sum --check --status devcore-project.sha256
 expected_sha256="$(awk 'NR == 1 { print $1 }' devcore-project.sha256)"
 bash install/install.sh \
   --source ./devcore-project \
-  --version 1.0.1 \
+  --version 1.1.0 \
   --sha256 "$expected_sha256"
 ```
 
-Version `1.0.1` is published as [`v1.0.1`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.0.1), from source commit `1266b221af90c318db54306eeb926afb873088c6`. Its executable SHA-256 is `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`.
+Version `1.1.0` is published as [`v1.1.0`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.1.0), from source commit `60f2ef09e52abca7b20f1572795579a549ba9d61`. Its executable SHA-256 is `df7dd3263197d33416b99699b5f09ee2b37bb4a45f55cc2a7bb4164dbbff9568`. It preserves existing owner-only v1 consumers and adds optional, backward-compatible supplemental-secret delivery. See the [changelog](../CHANGELOG.md) for the contract extension and its limitations.
 
 The installer validates the supplied digest, the executable's embedded version, its Bash syntax, and its interpreter line before writing. It installs to `~/.local/bin/devcore-project` with mode `0700`. Install, update, and rollback share an exclusive non-blocking lock at `~/.local/bin/.devcore-project-operation.lock`; an overlapping operation fails without changing the executable. The lock must be owned by the current user and have mode `0600`; symlinks and non-regular lock paths are rejected. The kernel releases the lock when the process exits. Updates stage the verified file in the same directory and atomically replace the target. If a prior target exists, the installer saves a mode `0700` copy as `devcore-project.previous.<global sequence>.<nanosecond UTC timestamp>.<pid>` before replacement. The fixed-width global sequence determines rollback order, so wall-clock adjustments cannot reorder backups; the timestamp and PID remain diagnostic metadata. It refuses symlink targets, symlinked `~/.local` or `~/.local/bin` directories, and paths that resolve outside `HOME`.
 
