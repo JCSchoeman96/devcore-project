@@ -300,6 +300,7 @@ class PostgresIntegrationTests(unittest.TestCase):
                 "DROP ROLE IF EXISTS membership_drift;",
                 check=False,
             )
+
     def _assert_database_invariants(self, container, role, createdb):
         query = (
             "SELECT r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole, "
