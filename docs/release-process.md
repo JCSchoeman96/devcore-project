@@ -1,6 +1,6 @@
 # Release process
 
-Status: current canonical process. The first repository-owned release, `v1.0.1`, was published on 2026-10-23 from source commit `1266b221af90c318db54306eeb926afb873088c6`. Post-merge CI run `39944654664` passed on that commit. The `devcore-project` asset SHA-256 is `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`.
+Status: current canonical process. The latest release, `v1.1.0`, was published on 2026-10-23. Tag [`v1.1.0`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.1.0) points exactly to source commit `60f2ef09e52abca7b20f1572795579a549ba9d61`. Post-merge CI run `39967037057` passed on that commit. The `devcore-project` asset SHA-256 is `df7dd3263197d33416b99699b5f09ee2b37bb4a45f55cc2a7bb4164dbbff9568`. This backward-compatible v1 contract extension adds optional supplemental-secret delivery; existing owner-only v1 consumers remain compatible. Durable Ticketing adoption remains TICK-42.
 
 The canonical source is the default branch of `JCSchoeman96/devcore-project`. Consumer repositories pin neither source files nor a moving executable URL; workstation users install explicit release assets.
 
@@ -15,4 +15,4 @@ For each release:
 5. Verify the release asset checksums and exercise install, update, and rollback in temporary `HOME` directories.
 6. Record the release commit, tag, asset checksums, CI run, and migration impact.
 
-TICK-45 established the canonical source without creating a tag or release. TICK-48 published the first repository-owned version, `1.0.1`, from the exact reviewed commit above. It preserves the installed snapshot's effective behavior and the existing v1 consumer contract, while recording canonical source, tests, installation, and rollback. The archived `-c` ownership query is a defect; this baseline retains the corrected stdin form from the installed snapshot. Existing v1-style consumer `.devcore/` declarations remain compatible. Supplemental-secret configuration is not included and remains TICK-43 work.
+TICK-45 established the canonical source without creating a tag or release. TICK-48 published the first repository-owned version, `1.0.1`, from its exact reviewed commit. It preserves the installed snapshot's effective behavior and the existing v1 consumer contract, while recording canonical source, tests, installation, and rollback. The archived `-c` ownership query is a defect; that baseline retained the corrected stdin form from the installed snapshot. Existing v1-style consumer `.devcore/` declarations remain compatible. At the time of TICK-48, supplemental-secret configuration was not included. TICK-43 later delivered that backward-compatible extension in v1.1.0.

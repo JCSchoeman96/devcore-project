@@ -1,6 +1,6 @@
 # Provenance and baseline decision
 
-Status: provenance record for the first canonical source and release. Updated during TICK-48 on 2026-10-23. Neither historical artifact below is represented as historical canonical source.
+Status: provenance record for canonical source and releases. Updated during TICK-49 on 2026-10-23. Neither historical artifact below is represented as historical canonical source.
 
 ## Recovered artifacts
 
@@ -61,4 +61,15 @@ The executable and changelog establish `1.0.1`, not historical `1.0.0`. The sele
 - Post-merge CI run: `39944654664` (`SUCCESS` on the source commit)
 - Release executable `devcore-project` SHA-256: `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`
 - Existing v1-style consumer `.devcore/` declarations remain compatible.
-- Supplemental-secret support is not included and remains TICK-43 work.
+- At the time of TICK-48, supplemental-secret support was not included. TICK-43 later delivered the capability in the backward-compatible v1.1.0 release below.
+
+## Repository-owned version 1.1.0
+
+TICK-43 added optional supplemental-secret delivery as a backward-compatible extension to the v1 consumer contract. Existing owner-only consumers remain compatible. Supplemental secrets are delivery-only: DevCore does not generate, rotate, or provision them. Durable Ticketing adoption remains TICK-42.
+
+- Release date: 2026-10-23
+- Tag: [`v1.1.0`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.1.0)
+- Source commit: `60f2ef09e52abca7b20f1572795579a549ba9d61`
+- Post-merge CI run: `39967037057` (`SUCCESS` on the source commit)
+- Release executable `devcore-project` SHA-256: `df7dd3263197d33416b99699b5f09ee2b37bb4a45f55cc2a7bb4164dbbff9568`
+- Release assets: `devcore-project` and `devcore-project.sha256`
