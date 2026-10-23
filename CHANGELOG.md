@@ -6,8 +6,10 @@ Backward-compatible contract extension for explicit supplemental-secret delivery
 
 - Add optional `SUPPLEMENTAL_SECRETS` project declaration pointing at a tab-separated binding map: `PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY`.
 - Deliver declared workstation-local secrets into rendered profiles and `run` without generating, rotating, or provisioning owner credentials.
-- Fail closed when a declared supplemental secret is missing; reject duplicate `(profile, env_var)` bindings and ambiguous profile overlap.
-- Scrub declared supplemental variables from the parent shell before `run` applies governed profile values.
+- Fail closed when a declared supplemental secret is missing; reject duplicate `(profile, env_var)` bindings, reserved owner token/key collisions, and ambiguous profile overlap during contract validation.
+- `plan`, `activate`, and `rotate` preflight supplemental/render requirements before mutating owner credentials; `run PROFILE` requires only bindings applicable to that profile.
+- Scrub every declared supplemental `ENV_VAR` from the parent shell before `run` applies governed profile values.
+- Use a generic single-line supplemental value contract (non-empty, no newline/CR/NUL); shared `all` bindings apply to `dev`, `test`, and `all` contexts.
 
 ## 1.0.1 (released 2026-10-23)
 
