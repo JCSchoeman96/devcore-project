@@ -47,11 +47,11 @@ Both queries read `pg_database.datdba` and return the database owner's role name
 
 The installed form is the correct behavior and the selected canonical baseline. It prevents Bash expansion through a quoted here-document and allows psql to quote the database name as a SQL literal. It does not change intended behavior: both forms express the same read-only owner lookup, but only the stdin form supports the psql variable used by the query. The canonical tests assert that the owner query travels over stdin and that the operation rejects an unexpected owner.
 
-## Provenance limits and rights
+## Historical source provenance and ownership
 
-No source repository, commit, tag, authorship record, signature, or supported executable updater was recovered. The archive's `install.sh` configures consumer project files; it does not install or update the executable. The installed script differs from the archive and no record explains who made that edit or when it was distributed.
+The user, JCSchoeman96, created and owns all DevCore materials, including the recovered archive and installed executable. No historical Git repository, source commit, tag, signature, or supported executable updater was recovered for these artifacts. The archive's `install.sh` configures consumer project files; it does not install or update the executable. The installed script differs from the archive in the database-owner query described above. The recovered files do not establish when that change was made or when the installed version was distributed. These limits describe historical Git provenance, not authorship or ownership.
 
-The archive and installed artifact are retained as legacy, unverified evidence. Neither is declared the original canonical source. The new Git history begins with this repository's bootstrap and canonicalization commits. No `LICENSE` is added because the recovered materials do not establish authorship or licensing rights. The repository remains private pending rights review.
+The archive and installed artifact are retained as legacy evidence. Neither is declared the original canonical Git source. The new Git history begins with this repository's bootstrap and canonicalization commits. This repository is publicly visible on GitHub and has no `LICENSE` file. No additional open-source license grant has been declared.
 
 ## Proposed first repository-owned version
 

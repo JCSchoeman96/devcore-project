@@ -1,6 +1,6 @@
 # Architecture
 
-Status: proposed canonical implementation baseline. Repository owner: `JCSchoeman96`. Source history begins with the TICK-45 canonicalization branch; this document does not claim ownership of the recovered v1.0.0 authorship. See [provenance](provenance.md).
+Status: proposed canonical implementation baseline. Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
 
 ## Ownership
 

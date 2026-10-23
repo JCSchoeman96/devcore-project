@@ -25,7 +25,7 @@ devcore-project run test -- <command>
 
 The first repository-owned baseline is proposed as version `1.0.1`. It is under review and has not been tagged or released. The recovered v1.0.0 files are stored as unverified provenance, not represented as historical canonical source. See [provenance](docs/provenance.md).
 
-This repository has no `LICENSE` because the historical artifacts do not establish authorship or licensing terms. Do not infer redistribution rights from their presence here.
+The user, JCSchoeman96, created and owns all DevCore materials. This repository is publicly visible on GitHub. It has no `LICENSE` file, and no additional open-source license grant has been declared. Historical Git provenance for the recovered v1.0.0 artifacts was not recovered; see [provenance](docs/provenance.md).
 
 ## Development
 

@@ -24,4 +24,4 @@ The tool does not treat workstation credentials as production credentials. Appli
 
 CI uses synthetic data and local mocks. It has no access to workstation secret files or databases. Do not add a real `.env`, secret-bearing fixture, private key, or credential-bearing command transcript.
 
-The repository has no `LICENSE` because the recovered artifacts do not establish authorship or license terms. Keep the repository private unless ownership and redistribution rights are established and explicitly reviewed.
+The user, JCSchoeman96, created and owns all DevCore materials. This repository is publicly visible on GitHub. It has no `LICENSE` file, and no additional open-source license grant has been declared. Historical Git provenance for the recovered artifacts was not recovered; see [provenance](provenance.md).
