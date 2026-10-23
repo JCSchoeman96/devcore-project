@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.1 (proposed, not released)
+## 1.0.1 (released 2026-10-23)
 
 The first repository-owned baseline adopts the behavior of the installed workstation snapshot, with an explicit version bump and canonical source history.
 
@@ -11,4 +11,4 @@ The first repository-owned baseline adopts the behavior of the installed worksta
 - Send PostgreSQL doctor fallback passwords through Docker stdin instead of Docker client arguments.
 - Preserve both legacy artifacts with their original checksums and document their provenance limits.
 
-No release tag has been created. Independent review and later release authorization are required.
+Release provenance: tag [`v1.0.1`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.0.1) points to source commit `1266b221af90c318db54306eeb926afb873088c6`. Post-merge CI run `39944654664` passed on that commit. The `devcore-project` asset SHA-256 is `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`. Existing v1-style consumer `.devcore/` declarations remain compatible.

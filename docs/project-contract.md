@@ -1,6 +1,6 @@
 # Consumer project contract
 
-Status: proposed canonical documentation of the v1.0.0-style `.devcore/` contract.
+Status: current documented v1 consumer contract, preserved by DevCore 1.0.1.
 
 ## Files a consumer owns
 

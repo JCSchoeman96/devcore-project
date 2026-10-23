@@ -1,6 +1,6 @@
 # Provenance and baseline decision
 
-Status: provenance record for the first canonical source proposal. Last verified during TICK-45 on 2026-10-23. Neither historical artifact below is represented as historical canonical source.
+Status: provenance record for the first canonical source and release. Updated during TICK-48 on 2026-10-23. Neither historical artifact below is represented as historical canonical source.
 
 ## Recovered artifacts
 
@@ -53,6 +53,12 @@ The user, JCSchoeman96, created and owns all DevCore materials, including the re
 
 The archive and installed artifact are retained as legacy evidence. Neither is declared the original canonical Git source. The new Git history begins with this repository's bootstrap and canonicalization commits. This repository is publicly visible on GitHub and has no `LICENSE` file. No additional open-source license grant has been declared.
 
-## Proposed first repository-owned version
+## First repository-owned version 1.0.1
 
-The executable and changelog propose `1.0.1`, not historical `1.0.0`. The selected baseline preserves the installed tool's effective command and project-contract behavior, and fixes the archive query defect by retaining the installed implementation. The new installer, tests, and documentation do not expand the consumer contract. This patch version is not tagged or released by TICK-45.
+The executable and changelog establish `1.0.1`, not historical `1.0.0`. The selected baseline preserves the installed tool's effective command and project-contract behavior, and fixes the archive query defect by retaining the installed implementation. The new installer, tests, and documentation do not expand the consumer contract. TICK-45 did not create a tag or release. TICK-48 published [`v1.0.1`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.0.1) from the exact reviewed source commit.
+
+- Source commit: `1266b221af90c318db54306eeb926afb873088c6`
+- Post-merge CI run: `39944654664` (`SUCCESS` on the source commit)
+- Release executable `devcore-project` SHA-256: `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`
+- Existing v1-style consumer `.devcore/` declarations remain compatible.
+- Supplemental-secret support is not included and remains TICK-43 work.

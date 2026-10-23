@@ -23,7 +23,7 @@ devcore-project run test -- <command>
 
 ## Repository status
 
-The first repository-owned baseline is proposed as version `1.0.1`. It is under review and has not been tagged or released. The recovered v1.0.0 files are stored as unverified provenance, not represented as historical canonical source. See [provenance](docs/provenance.md).
+The first repository-owned governed baseline was released as [`v1.0.1`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.0.1) from source commit `1266b221af90c318db54306eeb926afb873088c6`. The `devcore-project` asset SHA-256 is `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`; post-merge CI run `39944654664` passed on that commit. The release preserves the v1 consumer contract and existing v1-style `.devcore/` declarations. Supplemental-secret support is not included and remains TICK-43 work. The recovered v1.0.0 files remain historical provenance, not canonical source. See [provenance](docs/provenance.md).
 
 The user, JCSchoeman96, created and owns all DevCore materials. This repository is publicly visible on GitHub. It has no `LICENSE` file, and no additional open-source license grant has been declared. Historical Git provenance for the recovered v1.0.0 artifacts was not recovered; see [provenance](docs/provenance.md).
 

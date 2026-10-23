@@ -1,6 +1,6 @@
 # Installation and update
 
-Status: proposed user-local installer. It has been tested only in temporary directories for this review. It has not replaced the installed workstation executable.
+Status: current user-local installer. DevCore `1.0.1` passed disposable-HOME clean-install, upgrade, checksum-failure, and rollback checks. TICK-48 installed the published executable through this installer.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ bash install/install.sh \
   --sha256 "$expected_sha256"
 ```
 
-The example version is proposed only. No `v1.0.1` release exists yet.
+Version `1.0.1` is published as [`v1.0.1`](https://github.com/JCSchoeman96/devcore-project/releases/tag/v1.0.1), from source commit `1266b221af90c318db54306eeb926afb873088c6`. Its executable SHA-256 is `7b9c5a17abcc3d5591e3ba872b87f4ec27cf17bf367ddc9b8e8bb6716b2b030d`.
 
 The installer validates the supplied digest, the executable's embedded version, its Bash syntax, and its interpreter line before writing. It installs to `~/.local/bin/devcore-project` with mode `0700`. Install, update, and rollback share an exclusive non-blocking lock at `~/.local/bin/.devcore-project-operation.lock`; an overlapping operation fails without changing the executable. The lock must be owned by the current user and have mode `0600`; symlinks and non-regular lock paths are rejected. The kernel releases the lock when the process exits. Updates stage the verified file in the same directory and atomically replace the target. If a prior target exists, the installer saves a mode `0700` copy as `devcore-project.previous.<global sequence>.<nanosecond UTC timestamp>.<pid>` before replacement. The fixed-width global sequence determines rollback order, so wall-clock adjustments cannot reorder backups; the timestamp and PID remain diagnostic metadata. It refuses symlink targets, symlinked `~/.local` or `~/.local/bin` directories, and paths that resolve outside `HOME`.
 
@@ -39,4 +39,4 @@ Rollback selects the valid backup with the greatest global sequence, validates i
 
 ## Release asset contract
 
-A future release must attach the executable as `devcore-project` and its SHA-256 manifest as `devcore-project.sha256`. CI and the release process must derive both from the exact tagged commit. The checksum authenticates bytes against the release manifest; it is not a digital signature. Do not tag or install a release until its exact source and checks have been reviewed and release authorization is recorded.
+Each release must attach the executable as `devcore-project` and its SHA-256 manifest as `devcore-project.sha256`. CI and the release process must derive both from the exact tagged commit. The checksum authenticates bytes against the release manifest; it is not a digital signature. Do not tag or install a release until its exact source and checks have been reviewed and release authorization is recorded.
