@@ -70,8 +70,8 @@ Commands:
 
 Environment overrides:
   DEVCORE_CONFIG_DIR
-  DEVCORE_SECRETS_FILE
-  DEVCORE_GLOBAL_CONF
+  DEVCORE_SECRETS_FILE (must be project-db.env inside DEVCORE_CONFIG_DIR)
+  DEVCORE_GLOBAL_CONF (must be dev-core.conf inside DEVCORE_CONFIG_DIR)
   DEVCORE_PROJECT_CONF
 USAGE
 }
@@ -146,12 +146,59 @@ normalize_secret_key() {
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | sed -E 's/[-.]/_/g; s/[^A-Z0-9_]/_/g; s/^([0-9])/_\1/'
 }
 
+validate_state_paths() {
+  python3 -c '
+import os, stat, sys
+from pathlib import Path
+
+central = Path(sys.argv[1]).expanduser()
+secrets = Path(sys.argv[2]).expanduser()
+global_conf = Path(sys.argv[3]).expanduser()
+canonical_dir = Path(os.path.abspath(os.path.normpath(central)))
+expected = {
+    "DEVCORE_SECRETS_FILE": Path(os.path.abspath(canonical_dir / "project-db.env")),
+    "DEVCORE_GLOBAL_CONF": Path(os.path.abspath(canonical_dir / "dev-core.conf")),
+}
+for name, path in (("DEVCORE_SECRETS_FILE", secrets), ("DEVCORE_GLOBAL_CONF", global_conf)):
+    actual = Path(os.path.abspath(os.path.normpath(path)))
+    if actual != expected[name]:
+        raise SystemExit(f"ERROR: {name} must be the canonical file inside DEVCORE_CONFIG_DIR")
+
+try:
+    directory = canonical_dir.lstat()
+except FileNotFoundError:
+    directory = None
+if directory is not None:
+    if stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode):
+        raise SystemExit("ERROR: central config path must be a real directory")
+    if directory.st_uid != os.getuid() or stat.S_IMODE(directory.st_mode) != 0o700:
+        raise SystemExit("ERROR: central config directory must be owned by this user with mode 0700")
+
+for path in (expected["DEVCORE_SECRETS_FILE"], expected["DEVCORE_GLOBAL_CONF"]):
+    try:
+        entry = path.lstat()
+    except FileNotFoundError:
+        continue
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        raise SystemExit(f"ERROR: central state file must be a regular non-symlink file: {path}")
+    if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o600:
+        raise SystemExit(f"ERROR: central state file must be owned by this user with mode 0600: {path}")
+    if entry.st_nlink != 1:
+        raise SystemExit(f"ERROR: central state file must not have additional hard links: {path}")
+' "$CENTRAL_DIR" "$CENTRAL_SECRETS" "$GLOBAL_CONF"
+}
+
 write_global_defaults() {
   mkdir -p "$CENTRAL_DIR"
   chmod 700 "$CENTRAL_DIR"
-  if [[ ! -e "$GLOBAL_CONF" ]]; then
-    cat > "$GLOBAL_CONF" <<'EOF_GLOBAL'
-# dev-core workstation endpoints. Non-secret.
+  python3 -c '
+import os, stat, sys, tempfile
+from pathlib import Path
+
+directory = Path(sys.argv[1]).expanduser()
+global_conf = Path(sys.argv[2]).expanduser()
+secrets = Path(sys.argv[3]).expanduser()
+global_body = b"""# dev-core workstation endpoints. Non-secret.
 PG_DEV_HOST=127.0.0.1
 PG_DEV_PORT=55432
 PG_TEST_HOST=127.0.0.1
@@ -165,13 +212,48 @@ PG_TEST_CONTAINER=dev-core-postgres-test-1
 REDIS_DEV_CONTAINER=dev-core-redis-dev-1
 REDIS_TEST_CONTAINER=dev-core-redis-test-1
 PG_ADMIN_ROLE=devcore_admin
-EOF_GLOBAL
-    chmod 600 "$GLOBAL_CONF"
-  fi
-  if [[ ! -e "$CENTRAL_SECRETS" ]]; then
-    : > "$CENTRAL_SECRETS"
-    chmod 600 "$CENTRAL_SECRETS"
-  fi
+"""
+
+def validate(path):
+    try:
+        entry = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        raise RuntimeError(f"central state file must be a regular non-symlink file: {path}")
+    if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o600:
+        raise RuntimeError(f"central state file must be owned by this user with mode 0600: {path}")
+    if entry.st_nlink != 1:
+        raise RuntimeError(f"central state file must not have additional hard links: {path}")
+    return True
+
+def create_if_absent(path, body):
+    if validate(path):
+        return
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if not validate(path):
+                raise RuntimeError(f"central state file disappeared during initialization: {path}")
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+create_if_absent(global_conf, global_body)
+create_if_absent(secrets, b"")
+' "$CENTRAL_DIR" "$GLOBAL_CONF" "$CENTRAL_SECRETS"
 }
 
 load_global() {
@@ -454,11 +536,6 @@ container_running() {
 }
 
 ensure_secret_pair() {
-  mkdir -p "$CENTRAL_DIR"
-  chmod 700 "$CENTRAL_DIR"
-  [[ -e "$CENTRAL_SECRETS" ]] || { : > "$CENTRAL_SECRETS"; chmod 600 "$CENTRAL_SECRETS"; }
-  chmod 600 "$CENTRAL_SECRETS"
-
   local dev test
   dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
   test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
@@ -1124,7 +1201,12 @@ main() {
   need_cmd python3
   local cmd="${1-help}"; shift || true
   case "$cmd" in
-    activate|rotate|render)
+    install|plan|activate|doctor|render|rotate|run)
+      validate_state_paths
+      ;;
+  esac
+  case "$cmd" in
+    install|activate|rotate|render)
       if [[ -n "${DEVCORE_MUTATION_LOCK_FD:-}" ]]; then
         validate_inherited_mutation_lock
       else
@@ -1143,7 +1225,9 @@ main() {
       cmd_init "$@"
       ;;
     plan|activate|doctor|render|rotate|run)
-      write_global_defaults
+      case "$cmd" in
+        activate|render|rotate) write_global_defaults ;;
+      esac
       load_global
       load_project
       validate_project

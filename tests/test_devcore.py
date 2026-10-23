@@ -273,7 +273,7 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
                 time.sleep(0.01)
             self.assertTrue(entered.exists(), "first activation did not reach provisioning")
             before = self.secrets.read_bytes()
-            for command in ("activate", "rotate"):
+            for command in ("activate", "rotate", "install"):
                 second_process = self.start_tool(command, env=mock_env)
                 try:
                     second_stdout, second_stderr = second_process.communicate(timeout=2)
@@ -302,6 +302,104 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         for line in self.secrets.read_text().splitlines():
             value = line.split("=", 1)[1]
             self.assertNotIn(value, stdout + stderr + log_text)
+
+    def test_first_activation_race_keeps_install_plan_doctor_and_run_out_of_store(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        fresh_central = self.root / "first-activation-central"
+        fresh_central.mkdir(mode=0o700)
+        fresh_global = fresh_central / "dev-core.conf"
+        shutil.copyfile(self.global_conf, fresh_global)
+        fresh_global.chmod(0o600)
+        fresh_secrets = fresh_central / "project-db.env"
+        entered = self.root / "defaults-entered"
+        release = self.root / "defaults-release"
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+        chmod = self.mock_bin / "chmod"
+        chmod.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{2-}}\" = {str(fresh_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+            f"  : > {str(entered)!r}\n"
+            f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+            "fi\n"
+            f"exec {real_chmod} \"$@\"\n"
+        )
+        chmod.chmod(0o700)
+        mock_env, _docker_log = self._mock_env()
+        mock_env.update(
+            {
+                "DEVCORE_CONFIG_DIR": str(fresh_central),
+                "DEVCORE_GLOBAL_CONF": str(fresh_global),
+                "DEVCORE_SECRETS_FILE": str(fresh_secrets),
+            }
+        )
+
+        activation = self.start_tool("activate", env=mock_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first activation did not pause after locking the store")
+            self.assertFalse(fresh_secrets.exists())
+            initial_names = {path.name for path in fresh_central.iterdir()}
+            self.assertEqual(initial_names, {".devcore-project.lock", "dev-core.conf"})
+            conf_before = fresh_global.read_bytes()
+
+            install = self.run_tool("install", env=mock_env)
+            self.assertNotEqual(install.returncode, 0)
+            self.assertIn("mutation lock", install.stderr)
+            for command, args in (
+                ("plan", ()),
+                ("doctor", ()),
+                ("run", ("dev", "--", "true")),
+            ):
+                result = self.run_tool(command, *args, env=mock_env)
+                self.assertEqual(fresh_global.read_bytes(), conf_before, command)
+                self.assertFalse(fresh_secrets.exists(), command)
+                self.assertEqual(
+                    {path.name for path in fresh_central.iterdir()},
+                    initial_names,
+                    command,
+                )
+                self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+        finally:
+            release.touch()
+            stdout, stderr = activation.communicate(timeout=10)
+        self.assertEqual(activation.returncode, 0, stdout + stderr)
+        keys = {line.split("=", 1)[0] for line in fresh_secrets.read_text().splitlines()}
+        self.assertEqual(keys, {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"})
+        for line in fresh_secrets.read_text().splitlines():
+            self.assertNotIn(line.split("=", 1)[1], stdout + stderr)
+
+    def test_independent_config_roots_cannot_share_a_secret_file(self):
+        roots = [self.root / "central-one", self.root / "central-two"]
+        for override_name, filename in (
+            ("DEVCORE_SECRETS_FILE", "project-db.env"),
+            ("DEVCORE_GLOBAL_CONF", "dev-core.conf"),
+        ):
+            with self.subTest(override=override_name):
+                shared_state = self.root / f"shared-{filename}"
+                shared_state.write_text("SENTINEL=preserve-me\n")
+                shared_state.chmod(0o600)
+                before = shared_state.read_bytes()
+
+                for root in roots:
+                    env = self.env()
+                    env.update(
+                        {
+                            "DEVCORE_CONFIG_DIR": str(root),
+                            "DEVCORE_GLOBAL_CONF": str(root / "dev-core.conf"),
+                            "DEVCORE_SECRETS_FILE": str(root / "project-db.env"),
+                        }
+                    )
+                    env[override_name] = str(shared_state)
+                    result = self.run_tool("activate", env=env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(override_name, result.stderr)
+                    self.assertFalse(root.exists())
+                    self.assertEqual(shared_state.read_bytes(), before)
 
     def test_mutation_lock_is_released_when_owner_process_dies(self):
         self._start_database_endpoints()
@@ -969,11 +1067,69 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
 
     def test_install_creates_private_local_secret_files(self):
+        secrets_before = self.secrets.read_bytes()
+        config_before = self.global_conf.read_bytes()
         result = self.run_tool("install")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.secrets.read_bytes(), secrets_before)
+        self.assertEqual(self.global_conf.read_bytes(), config_before)
         self.assertEqual(self.central.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.secrets.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.global_conf.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_first_install_serializes_empty_store_creation(self):
+        fresh_central = self.root / "concurrent-install-central"
+        fresh_global = fresh_central / "dev-core.conf"
+        fresh_secrets = fresh_central / "project-db.env"
+        entered = self.root / "install-entered"
+        release = self.root / "install-release"
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+        chmod = self.mock_bin / "chmod"
+        chmod.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{2-}}\" = {str(fresh_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+            f"  : > {str(entered)!r}\n"
+            f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+            "fi\n"
+            f"exec {real_chmod} \"$@\"\n"
+        )
+        chmod.chmod(0o700)
+        env = self.env()
+        env.update(
+            {
+                "PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"],
+                "DEVCORE_CONFIG_DIR": str(fresh_central),
+                "DEVCORE_GLOBAL_CONF": str(fresh_global),
+                "DEVCORE_SECRETS_FILE": str(fresh_secrets),
+            }
+        )
+
+        first = self.start_tool("install", env=env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first install did not hold the lock during initialization")
+            self.assertFalse(fresh_global.exists())
+            self.assertFalse(fresh_secrets.exists())
+            self.assertEqual(
+                {path.name for path in fresh_central.iterdir()},
+                {".devcore-project.lock"},
+            )
+            second = self.run_tool("install", env=env)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            self.assertFalse(fresh_global.exists())
+            self.assertFalse(fresh_secrets.exists())
+        finally:
+            release.touch()
+            first_stdout, first_stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+        self.assertEqual(fresh_secrets.read_bytes(), b"")
+        self.assertIn(b"PG_ADMIN_ROLE=devcore_admin", fresh_global.read_bytes())
+        self.assertEqual(fresh_secrets.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(fresh_global.stat().st_mode & 0o777, 0o600)
 
     def test_documented_v1_consumer_contract_still_renders(self):
         config = self.project / ".devcore"

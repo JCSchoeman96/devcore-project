@@ -17,7 +17,7 @@ DEV and TEST use separate PostgreSQL containers, host ports, and persistent data
 | DEV | `postgres-dev`, `dev-core-postgres-dev-1` | `127.0.0.1:55432` | `postgres:18.6-alpine`, server `18.6` | `devcore_admin` | `dev-core_postgres_dev_data` at `/var/lib/postgresql`; `unless-stopped` |
 | TEST | `postgres-test`, `dev-core-postgres-test-1` | `127.0.0.1:55433` | `postgres:18.6-alpine`, server `18.6` | `devcore_admin` | `dev-core_postgres_test_data` at `/var/lib/postgresql`; `unless-stopped` |
 
-Both active PostgreSQL containers use image ID and repository digest `sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873`. The Compose file names a version tag but does not pin that digest, so a later pull may resolve to another image.
+Both active PostgreSQL containers have image ID `sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873` and RepoDigest `postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873`. The digest component matches the image ID in the current Docker inspection; these are separate identifiers. The Compose file names a version tag but does not pin that digest, so a later pull may resolve to another image.
 
 The Compose configuration initializes host authentication with `scram-sha-256`. The `devcore_admin` identity is the workstation bootstrap administrator used by DevCore for role and database provisioning. Project owner roles remain separate from this administrator. Each project declares its DEV and TEST owner roles and databases in `.devcore/project.conf`.
 

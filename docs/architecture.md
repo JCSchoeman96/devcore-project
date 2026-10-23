@@ -12,14 +12,14 @@ The workstation-local secret file under `~/.config/dev-core/` is the source for 
 
 ## Command flow
 
-- `plan` parses the project and workstation allocation, reports non-secret endpoints, role names, output paths, and whether each configured owner and supplemental secret exists, then fails closed when any declared supplemental secret is missing.
+- `plan` parses the project and workstation allocation, reports non-secret endpoints, role names, output paths, and whether each configured owner and supplemental secret exists, then fails closed when any declared supplemental secret is missing. It is read-only and does not initialize central files.
 - `activate` initializes missing workstation config, creates missing DEV/TEST owner secrets, provisions the configured PostgreSQL roles and databases, renders ignored environment files, and checks configured services.
-- `doctor` validates available credentials and checks configured endpoints. PostgreSQL checks authenticate without changing database state. Redis checks use a short-lived, project-prefixed probe key and remove it.
+- `doctor` validates available credentials and checks configured endpoints. PostgreSQL checks authenticate without changing database state. Redis checks use a short-lived, project-prefixed probe key and remove it. It does not initialize central files.
 - `render` regenerates ignored environment files from the current templates and owner secrets.
-- `run PROFILE -- COMMAND` removes declared supplemental variables from the parent environment, adds the rendered files for `PROFILE` and `all`, applies declared supplemental secrets from the workstation store, then replaces itself with the requested command.
+- `run PROFILE -- COMMAND` removes declared supplemental variables from the parent environment, adds the rendered files for `PROFILE` and `all`, applies declared supplemental secrets from the workstation store, then replaces itself with the requested command. It does not initialize central files.
 - `rotate` rotates both owner credentials, synchronizes the configured database roles, re-renders local files, and checks connectivity.
 
-`activate`, `rotate`, and `render` acquire the same nonblocking workstation lock under `CENTRAL_DIR`. This serializes secret-store updates and keeps `render` from reading DEV and TEST values across two separate replacements during rotation. The lock descriptor remains open through the command and the operating system releases it when the process exits.
+`install`, `activate`, `rotate`, and `render` acquire the same nonblocking workstation lock under `CENTRAL_DIR`. This serializes central-state initialization and secret-store updates, and keeps `render` from reading DEV and TEST values across two separate replacements during rotation. Missing state files are created atomically without replacing a file created concurrently. The normalized absolute paths of `DEVCORE_SECRETS_FILE` and `DEVCORE_GLOBAL_CONF` must match their canonical files under `CENTRAL_DIR`, so supported writers cannot split one store across different lock identities. The lock descriptor remains open through the command and the operating system releases it when the process exits.
 
 The tool calls `docker exec` for existing PostgreSQL/Redis containers when required. It does not manage container lifecycle. Shared service ownership remains with the workstation infrastructure owner.
 
