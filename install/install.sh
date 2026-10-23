@@ -106,7 +106,28 @@ backup_path=""
 if [[ -e "$target" ]]; then
   backup_temp="$(mktemp "$install_dir_real/.devcore-project.backup.XXXXXX")" || die "cannot stage previous executable"
   install -m 0700 -- "$target" "$backup_temp" || die "cannot back up previous executable"
-  backup_path="$install_dir_real/devcore-project.previous.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  backup_stamp="$(date -u +%Y%m%dT%H%M%S.%NZ)" || die "cannot create a UTC backup timestamp"
+  [[ "$backup_stamp" =~ ^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z$ ]] || die "date did not provide a nanosecond UTC timestamp"
+
+  backup_sequence=0
+  backup_prefix="devcore-project.previous.$backup_stamp."
+  shopt -s nullglob
+  matching_backups=("$install_dir_real/$backup_prefix"*)
+  shopt -u nullglob
+  for candidate in "${matching_backups[@]}"; do
+    candidate_name="${candidate##*/}"
+    [[ "$candidate_name" == "$backup_prefix"* ]] || continue
+    candidate_suffix="${candidate_name#"$backup_prefix"}"
+    if [[ "$candidate_suffix" =~ ^([0-9]{9})\.[0-9]+$ ]]; then
+      candidate_sequence=$((10#${BASH_REMATCH[1]}))
+      if ((candidate_sequence >= backup_sequence)); then
+        backup_sequence=$((candidate_sequence + 1))
+      fi
+    fi
+  done
+  ((backup_sequence <= 999999999)) || die "backup sequence is exhausted for this timestamp"
+  printf -v backup_sequence_text '%09d' "$backup_sequence"
+  backup_path="$install_dir_real/$backup_prefix$backup_sequence_text.$$"
   [[ ! -e "$backup_path" && ! -L "$backup_path" ]] || die "backup path already exists"
   mv -- "$backup_temp" "$backup_path" || die "cannot save previous executable"
   backup_temp=""

@@ -84,6 +84,28 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), original_bytes)
 
+    def test_installer_sequences_backups_when_timestamp_repeats(self):
+        date_bin = self.root / "mock-bin"
+        date_bin.mkdir()
+        date_command = date_bin / "date"
+        date_command.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "20261023T094600.100000000Z"\n')
+        date_command.chmod(0o700)
+        self.env["PATH"] = f"{date_bin}:{os.environ['PATH']}"
+
+        for version in ("1.0.0", "1.0.1", "1.0.2"):
+            checksum = self.write_source(version)
+            result = self.run_installer(version, checksum)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        backups = sorted(self.target.parent.glob("devcore-project.previous.*"))
+        self.assertEqual([backup.name.split(".")[-2] for backup in backups], ["000000000", "000000001"])
+        self.assertEqual(backups[0].read_bytes(), synthetic_tool("1.0.0"))
+        self.assertEqual(backups[1].read_bytes(), synthetic_tool("1.0.1"))
+
+        rollback = self.run_rollback()
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
+
     def test_bad_checksum_leaves_previous_install_unchanged(self):
         original_checksum = self.write_source("1.0.0")
         first = self.run_installer("1.0.0", original_checksum)
@@ -134,6 +156,38 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), original)
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o700)
         self.assertEqual(len(list(self.target.parent.glob("devcore-project.rolled-back.*"))), 1)
+
+    def test_rollback_uses_timestamp_before_pid_when_updates_share_a_second(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_bytes(synthetic_tool("1.0.2"))
+        self.target.chmod(0o700)
+
+        older = self.target.parent / "devcore-project.previous.20261023T094600.100000000Z.000000000.99999"
+        newer = self.target.parent / "devcore-project.previous.20261023T094600.100000001Z.000000000.1"
+        older.write_bytes(synthetic_tool("1.0.0"))
+        newer.write_bytes(synthetic_tool("1.0.1"))
+        older.chmod(0o700)
+        newer.chmod(0o700)
+
+        rollback = self.run_rollback()
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
+
+    def test_rollback_uses_sequence_when_backup_timestamps_match(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_bytes(synthetic_tool("1.0.2"))
+        self.target.chmod(0o700)
+
+        older = self.target.parent / "devcore-project.previous.20261023T094600.100000000Z.000000000.99999"
+        newer = self.target.parent / "devcore-project.previous.20261023T094600.100000000Z.000000001.1"
+        older.write_bytes(synthetic_tool("1.0.0"))
+        newer.write_bytes(synthetic_tool("1.0.1"))
+        older.chmod(0o700)
+        newer.chmod(0o700)
+
+        rollback = self.run_rollback()
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
 
     def test_symlink_target_is_rejected_without_changing_external_file(self):
         outside = self.root / "outside-tool"

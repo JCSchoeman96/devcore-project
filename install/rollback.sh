@@ -42,7 +42,7 @@ shopt -u nullglob
 backup=""
 for candidate in "${backups[@]}"; do
   candidate_name="${candidate##*/}"
-  [[ "$candidate_name" =~ ^devcore-project\.previous\.[0-9]{8}T[0-9]{6}Z\.[0-9]+$ ]] || continue
+  [[ "$candidate_name" =~ ^devcore-project\.previous\.[0-9]{8}T[0-9]{6}\.[0-9]{9}Z\.[0-9]{9}\.[0-9]+$ ]] || continue
   [[ -f "$candidate" && ! -L "$candidate" ]] || continue
   [[ -z "$backup" || "$candidate" > "$backup" ]] && backup="$candidate"
 done
@@ -69,7 +69,9 @@ current_backup_path=""
 if [[ -e "$target" ]]; then
   current_backup_temp="$(mktemp "$install_dir_real/.devcore-project.current.XXXXXX")" || die "cannot stage current executable"
   install -m 0700 -- "$target" "$current_backup_temp" || die "cannot preserve current executable"
-  current_backup_path="$install_dir_real/devcore-project.rolled-back.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  rollback_stamp="$(date -u +%Y%m%dT%H%M%S.%NZ)" || die "cannot create a UTC rollback timestamp"
+  [[ "$rollback_stamp" =~ ^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z$ ]] || die "date did not provide a nanosecond UTC timestamp"
+  current_backup_path="$install_dir_real/devcore-project.rolled-back.$rollback_stamp.$$"
   [[ ! -e "$current_backup_path" && ! -L "$current_backup_path" ]] || die "rollback backup path already exists"
   mv -- "$current_backup_temp" "$current_backup_path" || die "cannot preserve current executable"
   current_backup_temp=""
