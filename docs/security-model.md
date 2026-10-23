@@ -1,6 +1,6 @@
 # Security model
 
-Status: proposed canonical implementation baseline. Applies to the repository-owned v1-compatible tool.
+Status: current security baseline for the repository-owned DevCore 1.0.1 v1-compatible tool.
 
 ## Secret storage and handling
 
