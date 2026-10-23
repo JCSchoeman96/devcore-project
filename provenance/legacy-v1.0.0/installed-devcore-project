@@ -1,0 +1,745 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set +x
+umask 077
+
+VERSION="1.0.0"
+PROGRAM="devcore-project"
+
+CENTRAL_DIR="${DEVCORE_CONFIG_DIR:-$HOME/.config/dev-core}"
+CENTRAL_SECRETS="${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}"
+GLOBAL_CONF="${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}"
+PROJECT_CONF="${DEVCORE_PROJECT_CONF:-.devcore/project.conf}"
+
+log()  { printf '%s\n' "$*" >&2; }
+pass() { printf 'PASS: %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+devcore-project v1.0.0
+
+Reusable local-project bootstrap for the shared dev-core workstation stack.
+
+Commands:
+  install
+      Create ~/.config/dev-core/dev-core.conf and project-db.env if absent.
+      Does NOT create/start Docker services.
+
+  init --project-key KEY --dev-role ROLE --dev-db DB --test-role ROLE --test-db DB [options]
+      Create a repo-local .devcore skeleton. Tracked config contains no secrets.
+
+      Options:
+        --redis-prefix PREFIX          Default: project key
+        --dev-secret-key KEY           Default: <PROJECT>_DEV_DB_PASSWORD
+        --test-secret-key KEY          Default: <PROJECT>_TEST_DB_PASSWORD
+        --test-createdb yes|no         Default: yes
+        --use-redis yes|no             Default: yes
+        --local-env-file PATH          Default: .env.local
+        --force                        Replace existing .devcore skeleton
+
+  plan
+      Show the non-secret resolved project contract and readiness checks.
+
+  activate
+      Idempotently:
+        - create missing central DEV/TEST passwords;
+        - provision/refresh project PostgreSQL roles and databases;
+        - render ignored local env files from committed templates;
+        - verify PostgreSQL and Redis connectivity/isolation.
+      Never starts/stops/recreates dev-core.
+
+  doctor
+      Read-only DB authentication checks plus scoped Redis probe checks.
+      Never prints passwords.
+
+  render
+      Re-render ignored local env files from current central secrets.
+
+  rotate
+      Rotate BOTH DEV and TEST DB passwords, synchronize PostgreSQL roles,
+      re-render local env files, then run doctor. Values are never printed.
+
+  run PROFILE -- COMMAND [ARGS...]
+      Execute COMMAND with env files registered for PROFILE plus profile "all".
+      Examples:
+        devcore-project run dev -- mix phx.server
+        devcore-project run test -- mix test
+        devcore-project run all -- bash scripts/dev_local.sh doctor
+
+Environment overrides:
+  DEVCORE_CONFIG_DIR
+  DEVCORE_SECRETS_FILE
+  DEVCORE_GLOBAL_CONF
+  DEVCORE_PROJECT_CONF
+USAGE
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+require_no_xtrace() {
+  case "$-" in
+    *x*) die "refusing to handle secrets while shell xtrace is enabled" ;;
+  esac
+}
+
+kv_get() {
+  local file="$1" key="$2" default="${3-}"
+  [[ -f "$file" ]] || { printf '%s' "$default"; return 0; }
+  local line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == *"="* ]] || continue
+    k="${line%%=*}"
+    v="${line#*=}"
+    k="${k#"${k%%[![:space:]]*}"}"
+    k="${k%"${k##*[![:space:]]}"}"
+    if [[ "$k" == "$key" ]]; then
+      v="${v#"${v%%[![:space:]]*}"}"
+      v="${v%"${v##*[![:space:]]}"}"
+      printf '%s' "$v"
+      return 0
+    fi
+  done < "$file"
+  printf '%s' "$default"
+}
+
+kv_set_secret() {
+  local file="$1" key="$2" value="$3"
+  printf '%s' "$value" | python3 -c '
+from pathlib import Path
+import os, sys, tempfile
+path=Path(sys.argv[1]).expanduser(); key=sys.argv[2]; value=sys.stdin.read()
+path.parent.mkdir(parents=True, exist_ok=True)
+lines=path.read_text().splitlines() if path.exists() else []
+out=[]; replaced=False
+for raw in lines:
+    stripped=raw.lstrip()
+    if not stripped.startswith("#") and "=" in raw and raw.split("=",1)[0].strip()==key:
+        out.append(f"{key}={value}"); replaced=True
+    else:
+        out.append(raw)
+if not replaced:
+    out.append(f"{key}={value}")
+fd,tmp=tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+try:
+    with os.fdopen(fd,"w") as f:
+        f.write("\n".join(out)+"\n")
+        f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp,0o600)
+    os.replace(tmp,path)
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+os.chmod(path,0o600)
+' "$file" "$key"
+}
+
+generate_secret() {
+  python3 -c 'import secrets; print(secrets.token_hex(32), end="")'
+}
+
+normalize_secret_key() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | sed -E 's/[-.]/_/g; s/[^A-Z0-9_]/_/g; s/^([0-9])/_\1/'
+}
+
+write_global_defaults() {
+  mkdir -p "$CENTRAL_DIR"
+  chmod 700 "$CENTRAL_DIR"
+  if [[ ! -e "$GLOBAL_CONF" ]]; then
+    cat > "$GLOBAL_CONF" <<'EOF_GLOBAL'
+# dev-core workstation endpoints. Non-secret.
+PG_DEV_HOST=127.0.0.1
+PG_DEV_PORT=55432
+PG_TEST_HOST=127.0.0.1
+PG_TEST_PORT=55433
+REDIS_DEV_HOST=127.0.0.1
+REDIS_DEV_PORT=56379
+REDIS_TEST_HOST=127.0.0.1
+REDIS_TEST_PORT=56380
+PG_DEV_CONTAINER=dev-core-postgres-dev-1
+PG_TEST_CONTAINER=dev-core-postgres-test-1
+REDIS_DEV_CONTAINER=dev-core-redis-dev-1
+REDIS_TEST_CONTAINER=dev-core-redis-test-1
+PG_ADMIN_ROLE=devcore_admin
+EOF_GLOBAL
+    chmod 600 "$GLOBAL_CONF"
+  fi
+  if [[ ! -e "$CENTRAL_SECRETS" ]]; then
+    : > "$CENTRAL_SECRETS"
+    chmod 600 "$CENTRAL_SECRETS"
+  fi
+}
+
+load_global() {
+  PG_DEV_HOST="$(kv_get "$GLOBAL_CONF" PG_DEV_HOST 127.0.0.1)"
+  PG_DEV_PORT="$(kv_get "$GLOBAL_CONF" PG_DEV_PORT 55432)"
+  PG_TEST_HOST="$(kv_get "$GLOBAL_CONF" PG_TEST_HOST 127.0.0.1)"
+  PG_TEST_PORT="$(kv_get "$GLOBAL_CONF" PG_TEST_PORT 55433)"
+  REDIS_DEV_HOST="$(kv_get "$GLOBAL_CONF" REDIS_DEV_HOST 127.0.0.1)"
+  REDIS_DEV_PORT="$(kv_get "$GLOBAL_CONF" REDIS_DEV_PORT 56379)"
+  REDIS_TEST_HOST="$(kv_get "$GLOBAL_CONF" REDIS_TEST_HOST 127.0.0.1)"
+  REDIS_TEST_PORT="$(kv_get "$GLOBAL_CONF" REDIS_TEST_PORT 56380)"
+  PG_DEV_CONTAINER="$(kv_get "$GLOBAL_CONF" PG_DEV_CONTAINER dev-core-postgres-dev-1)"
+  PG_TEST_CONTAINER="$(kv_get "$GLOBAL_CONF" PG_TEST_CONTAINER dev-core-postgres-test-1)"
+  REDIS_DEV_CONTAINER="$(kv_get "$GLOBAL_CONF" REDIS_DEV_CONTAINER dev-core-redis-dev-1)"
+  REDIS_TEST_CONTAINER="$(kv_get "$GLOBAL_CONF" REDIS_TEST_CONTAINER dev-core-redis-test-1)"
+  PG_ADMIN_ROLE="$(kv_get "$GLOBAL_CONF" PG_ADMIN_ROLE devcore_admin)"
+}
+
+load_project() {
+  [[ -f "$PROJECT_CONF" ]] || die "missing $PROJECT_CONF; run '$PROGRAM init ...' or add the repo contract"
+  PROJECT_KEY="$(kv_get "$PROJECT_CONF" PROJECT_KEY)"
+  DEV_DB_ROLE="$(kv_get "$PROJECT_CONF" DEV_DB_ROLE)"
+  DEV_DB_NAME="$(kv_get "$PROJECT_CONF" DEV_DB_NAME)"
+  TEST_DB_ROLE="$(kv_get "$PROJECT_CONF" TEST_DB_ROLE)"
+  TEST_DB_NAME="$(kv_get "$PROJECT_CONF" TEST_DB_NAME)"
+  DEV_SECRET_KEY="$(kv_get "$PROJECT_CONF" DEV_SECRET_KEY)"
+  TEST_SECRET_KEY="$(kv_get "$PROJECT_CONF" TEST_SECRET_KEY)"
+  TEST_ROLE_CREATEDB="$(kv_get "$PROJECT_CONF" TEST_ROLE_CREATEDB yes)"
+  USE_REDIS="$(kv_get "$PROJECT_CONF" USE_REDIS yes)"
+  REDIS_PREFIX="$(kv_get "$PROJECT_CONF" REDIS_PREFIX "$PROJECT_KEY")"
+  RENDER_MAP="$(kv_get "$PROJECT_CONF" RENDER_MAP .devcore/render-map.tsv)"
+}
+
+validate_identifier() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^[a-z][a-z0-9_]{0,62}$ ]] || die "$label must match ^[a-z][a-z0-9_]{0,62}$ (got: $value)"
+}
+
+validate_secret_name() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "$label is not a valid central secret key: $value"
+}
+
+validate_secret_value() {
+  local label="$1" value="$2"
+  [[ "$value" =~ ^[A-Za-z0-9._~-]{20,}$ ]] || die "$label contains unsupported characters or is too short; rotate it with '$PROGRAM rotate'"
+}
+
+validate_project() {
+  [[ "$PROJECT_KEY" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "invalid PROJECT_KEY: $PROJECT_KEY"
+  validate_identifier DEV_DB_ROLE "$DEV_DB_ROLE"
+  validate_identifier DEV_DB_NAME "$DEV_DB_NAME"
+  validate_identifier TEST_DB_ROLE "$TEST_DB_ROLE"
+  validate_identifier TEST_DB_NAME "$TEST_DB_NAME"
+  validate_secret_name DEV_SECRET_KEY "$DEV_SECRET_KEY"
+  validate_secret_name TEST_SECRET_KEY "$TEST_SECRET_KEY"
+  [[ "$TEST_ROLE_CREATEDB" == "yes" || "$TEST_ROLE_CREATEDB" == "no" ]] || die "TEST_ROLE_CREATEDB must be yes or no"
+  [[ "$USE_REDIS" == "yes" || "$USE_REDIS" == "no" ]] || die "USE_REDIS must be yes or no"
+  [[ "$REDIS_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9:_-]*$ ]] || die "invalid REDIS_PREFIX: $REDIS_PREFIX"
+  [[ -f "$RENDER_MAP" ]] || die "missing render map: $RENDER_MAP"
+}
+
+ensure_ignored() {
+  local target="$1"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git check-ignore -q -- "$target" || die "refusing to write secret-bearing file not ignored by git: $target"
+  fi
+}
+
+for_each_render_row() {
+  local callback="$1"
+  python3 -c '
+from pathlib import Path
+import sys
+p=Path(sys.argv[1])
+for raw in p.read_text().splitlines():
+    if not raw.strip() or raw.lstrip().startswith("#"):
+        continue
+    parts=raw.split("\t")
+    if len(parts)<3:
+        raise SystemExit(f"Invalid render-map row (need PROFILE<TAB>TEMPLATE<TAB>TARGET): {raw}")
+    profile,template,target=parts[:3]
+    purge=parts[3] if len(parts)>3 else ""
+    print("\t".join([profile.strip(),template.strip(),target.strip(),purge.strip()]))
+' "$RENDER_MAP" | while IFS=$'\t' read -r profile template target purge; do
+    "$callback" "$profile" "$template" "$target" "$purge"
+  done
+}
+
+validate_render_row() {
+  local _profile="$1" template="$2" target="$3" _purge="$4"
+  [[ -f "$template" ]] || die "missing env template: $template"
+  ensure_ignored "$target"
+}
+
+check_render_contract() {
+  for_each_render_row validate_render_row
+}
+
+container_running() {
+  local name="$1"
+  [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]
+}
+
+ensure_secret_pair() {
+  mkdir -p "$CENTRAL_DIR"
+  chmod 700 "$CENTRAL_DIR"
+  [[ -e "$CENTRAL_SECRETS" ]] || { : > "$CENTRAL_SECRETS"; chmod 600 "$CENTRAL_SECRETS"; }
+  chmod 600 "$CENTRAL_SECRETS"
+
+  local dev test
+  dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
+  test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
+
+  if [[ -z "$dev" ]]; then
+    dev="$(generate_secret)"
+    kv_set_secret "$CENTRAL_SECRETS" "$DEV_SECRET_KEY" "$dev"
+    pass "created central DEV credential for $PROJECT_KEY"
+  fi
+  if [[ -z "$test" ]]; then
+    test="$(generate_secret)"
+    kv_set_secret "$CENTRAL_SECRETS" "$TEST_SECRET_KEY" "$test"
+    pass "created central TEST credential for $PROJECT_KEY"
+  fi
+
+  validate_secret_value DEV_DB_PASSWORD "$dev"
+  validate_secret_value TEST_DB_PASSWORD "$test"
+}
+
+require_secret_pair() {
+  [[ -f "$CENTRAL_SECRETS" ]] || die "missing central secrets file: $CENTRAL_SECRETS; run '$PROGRAM activate'"
+  local dev test
+  dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
+  test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
+  [[ -n "$dev" ]] || die "missing $DEV_SECRET_KEY in $CENTRAL_SECRETS; run '$PROGRAM activate'"
+  [[ -n "$test" ]] || die "missing $TEST_SECRET_KEY in $CENTRAL_SECRETS; run '$PROGRAM activate'"
+  validate_secret_value DEV_DB_PASSWORD "$dev"
+  validate_secret_value TEST_DB_PASSWORD "$test"
+}
+
+provision_database() {
+  local container="$1" role="$2" db="$3" password="$4" allow_createdb="$5"
+  container_running "$container" || die "required PostgreSQL container is not running: $container"
+
+  local create_flag="NOCREATEDB"
+  [[ "$allow_createdb" == "yes" ]] && create_flag="CREATEDB"
+
+  {
+    printf "\\set app_pass '%s'\n" "$password"
+    cat <<'SQL'
+SELECT format('CREATE ROLE %I LOGIN', :'role')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role')
+\gexec
+
+SELECT format(
+  'ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEROLE NOREPLICATION NOBYPASSRLS %s PASSWORD %L',
+  :'role', :'create_flag', :'app_pass'
+)
+\gexec
+
+SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'role')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db')
+\gexec
+SQL
+  } | docker exec -i "$container" \
+      psql -X -q -v ON_ERROR_STOP=1 -U "$PG_ADMIN_ROLE" -d postgres \
+      -v role="$role" -v db="$db" -v create_flag="$create_flag" >/dev/null
+
+  local owner
+  owner="$(
+    docker exec -i "$container" psql -X -qAt -U "$PG_ADMIN_ROLE" -d postgres -v db="$db" <<'SQL'
+SELECT pg_get_userbyid(datdba)
+FROM pg_database
+WHERE datname = :'db';
+SQL
+  )"
+  [[ "$owner" == "$role" ]] || die "database $db exists but owner is '$owner', expected '$role'; refusing implicit adoption"
+}
+
+provision_all() {
+  local dev test
+  dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
+  test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
+  validate_secret_value DEV_DB_PASSWORD "$dev"
+  validate_secret_value TEST_DB_PASSWORD "$test"
+  provision_database "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$dev" no
+  pass "DEV PostgreSQL role/database ready: $DEV_DB_ROLE / $DEV_DB_NAME"
+  provision_database "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$test" "$TEST_ROLE_CREATEDB"
+  pass "TEST PostgreSQL role/database ready: $TEST_DB_ROLE / $TEST_DB_NAME"
+}
+
+render_one() {
+  local profile="$1" template="$2" target="$3" purge="$4"
+  ensure_ignored "$target"
+  python3 -c '
+from pathlib import Path
+import os,re,sys,tempfile
+project_conf=Path(sys.argv[1]); global_conf=Path(sys.argv[2]); secret_file=Path(sys.argv[3])
+template=Path(sys.argv[4]); target=Path(sys.argv[5]); purge_arg=sys.argv[6]
+
+def parse(path):
+    out={}
+    if not path.exists(): return out
+    for raw in path.read_text().splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k,v=line.split("=",1); out[k.strip()]=v.strip()
+    return out
+p=parse(project_conf); g=parse(global_conf); s=parse(secret_file)
+values={
+  "PROJECT_KEY": p["PROJECT_KEY"],
+  "DEV_DB_HOST": g.get("PG_DEV_HOST","127.0.0.1"),
+  "DEV_DB_PORT": g.get("PG_DEV_PORT","55432"),
+  "DEV_DB_ROLE": p["DEV_DB_ROLE"],
+  "DEV_DB_NAME": p["DEV_DB_NAME"],
+  "DEV_DB_PASSWORD": s[p["DEV_SECRET_KEY"]],
+  "TEST_DB_HOST": g.get("PG_TEST_HOST","127.0.0.1"),
+  "TEST_DB_PORT": g.get("PG_TEST_PORT","55433"),
+  "TEST_DB_ROLE": p["TEST_DB_ROLE"],
+  "TEST_DB_NAME": p["TEST_DB_NAME"],
+  "TEST_DB_PASSWORD": s[p["TEST_SECRET_KEY"]],
+  "REDIS_DEV_HOST": g.get("REDIS_DEV_HOST","127.0.0.1"),
+  "REDIS_DEV_PORT": g.get("REDIS_DEV_PORT","56379"),
+  "REDIS_TEST_HOST": g.get("REDIS_TEST_HOST","127.0.0.1"),
+  "REDIS_TEST_PORT": g.get("REDIS_TEST_PORT","56380"),
+  "REDIS_DEV_NAMESPACE": p.get("REDIS_PREFIX",p["PROJECT_KEY"])+":dev",
+  "REDIS_TEST_NAMESPACE_BASE": p.get("REDIS_PREFIX",p["PROJECT_KEY"])+":test",
+}
+body=template.read_text()
+for k,v in values.items(): body=body.replace("{{"+k+"}}",v)
+left=sorted(set(re.findall(r"\{\{([A-Z0-9_]+)\}\}",body)))
+if left: raise SystemExit("Unresolved template tokens: "+", ".join(left))
+managed_start="# >>> DEVCORE MANAGED >>>"
+managed_end="# <<< DEVCORE MANAGED <<<"
+block=managed_start+"\n"+body.rstrip()+"\n"+managed_end
+existing=target.read_text() if target.exists() else ""
+# Remove prior managed block.
+existing=re.sub(re.escape(managed_start)+r".*?"+re.escape(managed_end)+r"\n?","",existing,flags=re.S)
+# Remove duplicate keys managed by this template plus explicitly purged legacy keys.
+managed_keys=[]
+for raw in body.splitlines():
+    line=raw.strip()
+    if line.startswith("export "): line=line[7:].lstrip()
+    if line and not line.startswith("#") and "=" in line:
+        managed_keys.append(line.split("=",1)[0].strip())
+purge=[x.strip() for x in purge_arg.split(",") if x.strip()]
+remove=set(managed_keys+purge)
+kept=[]
+for raw in existing.splitlines():
+    probe=raw.strip()
+    if probe.startswith("export "): probe=probe[7:].lstrip()
+    if probe and not probe.startswith("#") and "=" in probe and probe.split("=",1)[0].strip() in remove:
+        continue
+    kept.append(raw)
+text="\n".join(kept).rstrip()
+if text: text += "\n\n"
+text += block+"\n"
+target.parent.mkdir(parents=True,exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix=f".{target.name}.",dir=str(target.parent),text=True)
+try:
+    with os.fdopen(fd,"w") as f:
+        f.write(text); f.flush(); os.fsync(f.fileno())
+    os.chmod(tmp,0o600); os.replace(tmp,target)
+finally:
+    if os.path.exists(tmp): os.unlink(tmp)
+os.chmod(target,0o600)
+' "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge"
+  pass "rendered $target ($profile)"
+}
+
+render_all() {
+  check_render_contract
+  for_each_render_row render_one
+}
+
+tcp_check() {
+  local label="$1" host="$2" port="$3"
+  python3 -c '
+import socket,sys
+host=sys.argv[1]; port=int(sys.argv[2])
+with socket.create_connection((host,port),timeout=2):
+    pass
+' "$host" "$port" || die "$label endpoint unavailable at $host:$port"
+  pass "$label endpoint reachable: $host:$port"
+}
+
+db_doctor() {
+  local label="$1" container="$2" role="$3" db="$4" secret_key="$5" host="$6" port="$7"
+  container_running "$container" || die "$label PostgreSQL container unavailable: $container"
+  tcp_check "$label PostgreSQL" "$host" "$port"
+  local password result
+  password="$(kv_get "$CENTRAL_SECRETS" "$secret_key")"
+  validate_secret_value "$label password" "$password"
+  if command -v psql >/dev/null 2>&1; then
+    result="$(PGPASSWORD="$password" psql -X -qAt -h "$host" -p "$port" -U "$role" -d "$db" \
+      -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
+  else
+    result="$(docker exec -e PGPASSWORD="$password" "$container" \
+      psql -X -qAt -h 127.0.0.1 -U "$role" -d "$db" \
+      -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
+  fi
+  [[ "$result" == "$role|$db|"* ]] || die "$label PostgreSQL authentication proof failed"
+  pass "$label PostgreSQL authentication: $role / $db"
+}
+
+redis_doctor() {
+  local label="$1" container="$2" namespace="$3" host="$4" port="$5"
+  container_running "$container" || die "$label Redis container unavailable: $container"
+  tcp_check "$label Redis" "$host" "$port"
+  local probe="${namespace}:__devcore_probe:$$"
+  local ping set_result get_result
+  if command -v redis-cli >/dev/null 2>&1; then
+    ping="$(redis-cli -h "$host" -p "$port" --raw PING)"
+    [[ "$ping" == "PONG" ]] || die "$label Redis PING failed"
+    set_result="$(redis-cli -h "$host" -p "$port" --raw SET "$probe" "1" EX 15 NX)"
+    [[ "$set_result" == "OK" ]] || die "$label Redis scoped probe SET failed"
+    get_result="$(redis-cli -h "$host" -p "$port" --raw GET "$probe")"
+    redis-cli -h "$host" -p "$port" --raw DEL "$probe" >/dev/null
+  else
+    ping="$(docker exec "$container" redis-cli --raw PING)"
+    [[ "$ping" == "PONG" ]] || die "$label Redis PING failed"
+    set_result="$(docker exec "$container" redis-cli --raw SET "$probe" "1" EX 15 NX)"
+    [[ "$set_result" == "OK" ]] || die "$label Redis scoped probe SET failed"
+    get_result="$(docker exec "$container" redis-cli --raw GET "$probe")"
+    docker exec "$container" redis-cli --raw DEL "$probe" >/dev/null
+  fi
+  [[ "$get_result" == "1" ]] || die "$label Redis scoped probe GET failed"
+  pass "$label Redis: PONG + scoped probe ($namespace:...)"
+}
+
+check_local_modes() {
+  local _profile="$1" _template="$2" target="$3" _purge="$4"
+  [[ -f "$target" ]] || die "rendered local env missing: $target"
+  local mode
+  mode="$(stat -c '%a' "$target")"
+  [[ "$mode" == "600" ]] || die "$target mode is $mode, expected 600"
+}
+
+doctor_all() {
+  db_doctor DEV "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$DEV_SECRET_KEY" "$PG_DEV_HOST" "$PG_DEV_PORT"
+  db_doctor TEST "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$TEST_SECRET_KEY" "$PG_TEST_HOST" "$PG_TEST_PORT"
+  if [[ "$USE_REDIS" == "yes" ]]; then
+    redis_doctor DEV "$REDIS_DEV_CONTAINER" "${REDIS_PREFIX}:dev" "$REDIS_DEV_HOST" "$REDIS_DEV_PORT"
+    redis_doctor TEST "$REDIS_TEST_CONTAINER" "${REDIS_PREFIX}:test" "$REDIS_TEST_HOST" "$REDIS_TEST_PORT"
+  fi
+  for_each_render_row check_local_modes
+}
+
+print_plan() {
+  printf 'Project: %s\n' "$PROJECT_KEY"
+  printf 'DEV PostgreSQL:  %s@%s:%s/%s\n' "$DEV_DB_ROLE" "$PG_DEV_HOST" "$PG_DEV_PORT" "$DEV_DB_NAME"
+  printf 'TEST PostgreSQL: %s@%s:%s/%s (CREATEDB=%s)\n' "$TEST_DB_ROLE" "$PG_TEST_HOST" "$PG_TEST_PORT" "$TEST_DB_NAME" "$TEST_ROLE_CREATEDB"
+  if [[ "$USE_REDIS" == "yes" ]]; then
+    printf 'Redis DEV:       %s:%s namespace=%s:dev\n' "$REDIS_DEV_HOST" "$REDIS_DEV_PORT" "$REDIS_PREFIX"
+    printf 'Redis TEST:      %s:%s namespace-base=%s:test\n' "$REDIS_TEST_HOST" "$REDIS_TEST_PORT" "$REDIS_PREFIX"
+  else
+    printf 'Redis:           not used by this project\n'
+  fi
+  printf 'Central secrets: %s\n' "$CENTRAL_SECRETS"
+  printf 'DEV secret key:  %s [%s]\n' "$DEV_SECRET_KEY" "$( [[ -n "$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")" ]] && echo present || echo missing )"
+  printf 'TEST secret key: %s [%s]\n' "$TEST_SECRET_KEY" "$( [[ -n "$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")" ]] && echo present || echo missing )"
+  printf 'Rendered env files:\n'
+  python3 -c '
+from pathlib import Path
+import sys
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    if not raw.strip() or raw.lstrip().startswith("#"): continue
+    p=raw.split("\t")
+    print(f"  - profile={p[0].strip()} target={p[2].strip()} template={p[1].strip()}")
+' "$RENDER_MAP"
+}
+
+rotate_all() {
+  require_no_xtrace
+  local old_dev old_test new_dev new_test
+  old_dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
+  old_test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
+  [[ -n "$old_dev" && -n "$old_test" ]] || die "cannot rotate missing credentials; run activate first"
+  new_dev="$(generate_secret)"
+  new_test="$(generate_secret)"
+
+  kv_set_secret "$CENTRAL_SECRETS" "$DEV_SECRET_KEY" "$new_dev"
+  kv_set_secret "$CENTRAL_SECRETS" "$TEST_SECRET_KEY" "$new_test"
+
+  if ! provision_database "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$new_dev" no || \
+     ! provision_database "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$new_test" "$TEST_ROLE_CREATEDB"; then
+    warn "rotation failed; restoring prior central values and role passwords"
+    kv_set_secret "$CENTRAL_SECRETS" "$DEV_SECRET_KEY" "$old_dev"
+    kv_set_secret "$CENTRAL_SECRETS" "$TEST_SECRET_KEY" "$old_test"
+    provision_database "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$old_dev" no || true
+    provision_database "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$old_test" "$TEST_ROLE_CREATEDB" || true
+    die "credential rotation rolled back"
+  fi
+
+  render_all
+  doctor_all
+  pass "rotated DEV and TEST credentials for $PROJECT_KEY; values were not printed"
+}
+
+run_profile() {
+  local profile="$1"; shift
+  [[ "${1-}" == "--" ]] || die "usage: $PROGRAM run PROFILE -- COMMAND [ARGS...]"
+  shift
+  [[ $# -gt 0 ]] || die "run requires a command"
+  python3 -c '
+from pathlib import Path
+import os,sys
+profile=sys.argv[1]; render_map=Path(sys.argv[2]); cmd=sys.argv[3:]
+
+def parse_env(path, env):
+    if not path.exists():
+        raise SystemExit(f"Missing local env file: {path}. Run devcore-project activate first.")
+    for raw in path.read_text().splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        if line.startswith("export "): line=line[7:].lstrip()
+        k,v=line.split("=",1); k=k.strip(); v=v.strip()
+        if len(v)>=2 and v[0]==v[-1] and v[0] in (chr(34), chr(39)):
+            v=v[1:-1]
+        env[k]=v
+
+env=os.environ.copy()
+for raw in render_map.read_text().splitlines():
+    if not raw.strip() or raw.lstrip().startswith("#"): continue
+    parts=raw.split("\t")
+    row_profile,target=parts[0].strip(),Path(parts[2].strip())
+    if row_profile in ("all",profile): parse_env(target,env)
+os.execvpe(cmd[0],cmd,env)
+' "$profile" "$RENDER_MAP" "$@"
+}
+
+cmd_init() {
+  local project_key="" dev_role="" dev_db="" test_role="" test_db=""
+  local redis_prefix="" dev_secret_key="" test_secret_key="" test_createdb="yes" use_redis="yes"
+  local local_env_file=".env.local" force="no"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project-key) project_key="$2"; shift 2 ;;
+      --dev-role) dev_role="$2"; shift 2 ;;
+      --dev-db) dev_db="$2"; shift 2 ;;
+      --test-role) test_role="$2"; shift 2 ;;
+      --test-db) test_db="$2"; shift 2 ;;
+      --redis-prefix) redis_prefix="$2"; shift 2 ;;
+      --dev-secret-key) dev_secret_key="$2"; shift 2 ;;
+      --test-secret-key) test_secret_key="$2"; shift 2 ;;
+      --test-createdb) test_createdb="$2"; shift 2 ;;
+      --use-redis) use_redis="$2"; shift 2 ;;
+      --local-env-file) local_env_file="$2"; shift 2 ;;
+      --force) force="yes"; shift ;;
+      *) die "unknown init option: $1" ;;
+    esac
+  done
+  [[ -n "$project_key" && -n "$dev_role" && -n "$dev_db" && -n "$test_role" && -n "$test_db" ]] || \
+    die "init requires --project-key --dev-role --dev-db --test-role --test-db"
+  [[ "$test_createdb" == "yes" || "$test_createdb" == "no" ]] || die "--test-createdb must be yes or no"
+  [[ "$use_redis" == "yes" || "$use_redis" == "no" ]] || die "--use-redis must be yes or no"
+  redis_prefix="${redis_prefix:-$project_key}"
+  local upper
+  upper="$(normalize_secret_key "$project_key")"
+  dev_secret_key="${dev_secret_key:-${upper}_DEV_DB_PASSWORD}"
+  test_secret_key="${test_secret_key:-${upper}_TEST_DB_PASSWORD}"
+
+  if [[ -e .devcore && "$force" != "yes" ]]; then
+    die ".devcore already exists; use --force only after reviewing existing project contract"
+  fi
+  mkdir -p .devcore
+  cat > .devcore/project.conf <<EOF_CONF
+# Committed, non-secret project allocation for the workstation dev-core stack.
+PROJECT_KEY=$project_key
+DEV_DB_ROLE=$dev_role
+DEV_DB_NAME=$dev_db
+TEST_DB_ROLE=$test_role
+TEST_DB_NAME=$test_db
+DEV_SECRET_KEY=$dev_secret_key
+TEST_SECRET_KEY=$test_secret_key
+TEST_ROLE_CREATEDB=$test_createdb
+USE_REDIS=$use_redis
+REDIS_PREFIX=$redis_prefix
+RENDER_MAP=.devcore/render-map.tsv
+EOF_CONF
+  cat > .devcore/env.local.template <<'EOF_TEMPLATE'
+# Customize these variable names to the repository's real config contract.
+DEV_DATABASE_USERNAME={{DEV_DB_ROLE}}
+DEV_DATABASE_PASSWORD={{DEV_DB_PASSWORD}}
+DEV_DATABASE_HOST={{DEV_DB_HOST}}
+DEV_DATABASE_PORT={{DEV_DB_PORT}}
+DEV_DATABASE_NAME={{DEV_DB_NAME}}
+TEST_DATABASE_USERNAME={{TEST_DB_ROLE}}
+TEST_DATABASE_PASSWORD={{TEST_DB_PASSWORD}}
+TEST_DATABASE_HOST={{TEST_DB_HOST}}
+TEST_DATABASE_PORT={{TEST_DB_PORT}}
+TEST_DATABASE_NAME={{TEST_DB_NAME}}
+REDIS_DEV_URL=redis://{{REDIS_DEV_HOST}}:{{REDIS_DEV_PORT}}
+REDIS_TEST_URL=redis://{{REDIS_TEST_HOST}}:{{REDIS_TEST_PORT}}
+REDIS_DEV_NAMESPACE={{REDIS_DEV_NAMESPACE}}
+REDIS_TEST_NAMESPACE_BASE={{REDIS_TEST_NAMESPACE_BASE}}
+EOF_TEMPLATE
+  printf 'all\t.devcore/env.local.template\t%s\t\n' "$local_env_file" > .devcore/render-map.tsv
+  cat > .devcore/README.md <<'EOF_README'
+# dev-core local contract
+
+These files are committed and contain no secrets.
+
+1. Edit `env.local.template` so its variable names exactly match this repository.
+2. Ensure every render target in `render-map.tsv` is ignored by Git.
+3. Add obsolete local variable names to the optional fourth TSV column as a comma-separated purge list.
+4. Run `devcore-project activate` from the repository root.
+
+Redis namespaces are key prefixes, not server-side resources. Tests should append a per-run nonce to the TEST namespace base when concurrent isolation matters.
+EOF_README
+  pass "created .devcore skeleton for $project_key"
+  warn "customize .devcore/env.local.template and ensure '$local_env_file' is gitignored before activate"
+}
+
+main() {
+  need_cmd python3
+  local cmd="${1-help}"; shift || true
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+    install)
+      write_global_defaults
+      pass "dev-core config initialized at $CENTRAL_DIR"
+      ;;
+    init)
+      cmd_init "$@"
+      ;;
+    plan|activate|doctor|render|rotate|run)
+      write_global_defaults
+      load_global
+      load_project
+      validate_project
+      check_render_contract
+      case "$cmd" in
+        plan)
+          print_plan
+          ;;
+        activate)
+          need_cmd docker
+          require_no_xtrace
+          ensure_secret_pair
+          provision_all
+          render_all
+          doctor_all
+          pass "project '$PROJECT_KEY' activated"
+          ;;
+        doctor)
+          need_cmd docker
+          require_secret_pair
+          doctor_all
+          ;;
+        render)
+          require_no_xtrace
+          require_secret_pair
+          render_all
+          ;;
+        rotate)
+          need_cmd docker
+          require_secret_pair
+          rotate_all
+          ;;
+        run)
+          run_profile "$@"
+          ;;
+      esac
+      ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

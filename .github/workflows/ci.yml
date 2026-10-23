@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Check Bash syntax
+        run: bash -n bin/devcore-project install/install.sh install/rollback.sh
+      - name: Run ShellCheck
+        run: shellcheck bin/devcore-project install/install.sh install/rollback.sh
+      - name: Check legacy artifact checksums
+        run: |
+          (cd provenance/legacy-v1.0.0 && sha256sum --check SHA256SUMS)
+          archive_dir="$(mktemp -d)"
+          unzip -q provenance/legacy-v1.0.0/devcore-project-bootstrap-v1.0.0.zip -d "$archive_dir"
+          (cd "$archive_dir/devcore-project-bootstrap-v1.0.0" && sha256sum --check SHA256SUMS.txt)
+          bundled_script="$archive_dir/devcore-project-bootstrap-v1.0.0/bin/devcore-project"
+          printf '%s  %s\n' \
+            d30a90ba12c5394ec573ced1cdf80362c428280f7231c186ef7d05aa489adfd5 \
+            "$bundled_script" | sha256sum --check
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
