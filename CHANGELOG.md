@@ -9,7 +9,7 @@ Backward-compatible contract extension for explicit supplemental-secret delivery
 - Fail closed when a declared supplemental secret is missing; reject duplicate `(profile, env_var)` bindings, reserved owner token/key collisions, and ambiguous profile overlap during contract validation.
 - `plan`, `activate`, and `rotate` preflight supplemental/render requirements before mutating owner credentials; `run PROFILE` requires only bindings applicable to that profile.
 - Scrub every declared supplemental `ENV_VAR` from the parent shell before `run` applies governed profile values.
-- Use a generic single-line supplemental value contract (non-empty, no newline/CR/NUL); shared `all` bindings apply to `dev`, `test`, and `all` contexts.
+- Validate supplemental values in Bash only (never via child-process argv) using the portable literal/token alphabet `^[A-Za-z0-9._:/+=,@%_-]+$` so rendered shell-sourced env files remain safe; shared `all` bindings apply to `dev`, `test`, and `all` contexts.
 
 ## 1.0.1 (released 2026-10-23)
 

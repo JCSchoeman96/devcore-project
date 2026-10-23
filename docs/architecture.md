@@ -23,6 +23,6 @@ The tool calls `docker exec` for existing PostgreSQL/Redis containers when requi
 
 ## Baseline limits
 
-The contract has one DEV owner-secret binding and one TEST owner-secret binding. Optional supplemental-secret bindings (see [project contract](project-contract.md)) deliver additional workstation-local secrets without owner provisioning. Supplemental secrets are not generated or rotated by DevCore.
+The contract has one DEV owner-secret binding and one TEST owner-secret binding. Optional supplemental-secret bindings (see [project contract](project-contract.md)) deliver additional workstation-local secrets without owner provisioning. Supplemental secrets are not generated or rotated by DevCore. Supplemental values are validated in Bash against a portable literal/token alphabet so they remain safe when consumer templates are shell-sourced; secret bytes are never passed through child-process argv during validation.
 
 No application runtime should copy this executable into product code. The executable is a workstation development tool, not a production credential manager.
