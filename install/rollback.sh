@@ -14,6 +14,7 @@ fi
 [[ -n "${HOME:-}" && -d "$HOME" ]] || die "HOME must name an existing user directory"
 [[ "${EUID:-0}" -ne 0 ]] || die "run rollback as the target user, without root"
 command -v install >/dev/null 2>&1 || die "required command not found: install"
+command -v flock >/dev/null 2>&1 || die "required command not found: flock"
 
 home_real="$(cd -- "$HOME" && pwd -P)" || die "cannot resolve HOME"
 local_dir="$HOME/.local"
@@ -28,6 +29,14 @@ case "$install_dir_real/" in
 esac
 
 target="$install_dir_real/devcore-project"
+operation_lock="$install_dir_real/.devcore-project-operation.lock"
+[[ ! -L "$operation_lock" ]] || die "refusing a symlink at the DevCore operation lock"
+if [[ -e "$operation_lock" && ! -f "$operation_lock" ]]; then
+  die "DevCore operation lock path is not a regular file"
+fi
+exec {operation_lock_fd}>>"$operation_lock" || die "cannot open the DevCore operation lock"
+flock -n "$operation_lock_fd" || die "another DevCore install or rollback is active"
+
 if [[ -L "$target" ]]; then
   die "refusing to replace a symlink at the install target"
 fi

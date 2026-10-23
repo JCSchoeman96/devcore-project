@@ -1,7 +1,9 @@
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -40,7 +42,7 @@ class InstallerTests(unittest.TestCase):
         self.source.chmod(0o700)
         return hashlib.sha256(data).hexdigest()
 
-    def run_installer(self, version, checksum):
+    def run_installer(self, version, checksum, env=None):
         return subprocess.run(
             [
                 "bash",
@@ -52,7 +54,7 @@ class InstallerTests(unittest.TestCase):
                 "--sha256",
                 checksum,
             ],
-            env=self.env,
+            env=env or self.env,
             capture_output=True,
             text=True,
             timeout=10,
@@ -73,6 +75,9 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertTrue(self.target.is_file())
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o700)
+        operation_lock = self.target.parent / ".devcore-project-operation.lock"
+        self.assertTrue(operation_lock.is_file())
+        self.assertEqual(operation_lock.stat().st_mode & 0o777, 0o600)
         original_bytes = self.target.read_bytes()
 
         next_checksum = self.write_source("1.0.1")
@@ -105,6 +110,91 @@ class InstallerTests(unittest.TestCase):
         rollback = self.run_rollback()
         self.assertEqual(rollback.returncode, 0, rollback.stderr)
         self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
+
+    def test_concurrent_install_and_rollback_are_rejected(self):
+        original_checksum = self.write_source("1.0.0")
+        first_install = self.run_installer("1.0.0", original_checksum)
+        self.assertEqual(first_install.returncode, 0, first_install.stderr)
+        original_bytes = self.target.read_bytes()
+
+        date_bin = self.root / "mock-bin"
+        date_bin.mkdir()
+        date_command = date_bin / "date"
+        date_command.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "20261023T094600.100000000Z"\n')
+        date_command.chmod(0o700)
+        install_wrapper = date_bin / "install"
+        install_wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            '"$REAL_INSTALL" "$@"\n'
+            'if [[ "${BLOCK_BACKUP_COPY:-0}" == 1 && "${4-}" == "$INSTALL_TARGET" && ! -e "$BLOCK_USED" ]]; then\n'
+            '  : > "$BLOCK_USED"\n'
+            '  while [[ ! -e "$BLOCK_RELEASE" ]]; do sleep 0.01; done\n'
+            "fi\n"
+        )
+        install_wrapper.chmod(0o700)
+
+        blocked_env = dict(self.env)
+        blocked_env["PATH"] = f"{date_bin}:{os.environ['PATH']}"
+        blocked_env["REAL_INSTALL"] = shutil.which("install")
+        blocked_env["INSTALL_TARGET"] = str(self.target)
+        blocked_env["BLOCK_BACKUP_COPY"] = "1"
+        blocked_env["BLOCK_USED"] = str(self.root / "backup-copied")
+        blocked_env["BLOCK_RELEASE"] = str(self.root / "release-backup-copy")
+
+        update_checksum = self.write_source("1.0.1")
+        first_update = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALLER),
+                "--source",
+                str(self.source),
+                "--version",
+                "1.0.1",
+                "--sha256",
+                update_checksum,
+            ],
+            env=blocked_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        second_update = None
+        concurrent_rollback = None
+        first_stderr = ""
+        try:
+            deadline = time.monotonic() + 5
+            while not Path(blocked_env["BLOCK_USED"]).exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(Path(blocked_env["BLOCK_USED"]).exists(), "installer did not reach the backup snapshot")
+
+            second_checksum = self.write_source("1.0.2")
+            second_env = dict(blocked_env)
+            second_env["BLOCK_BACKUP_COPY"] = "0"
+            second_update = self.run_installer("1.0.2", second_checksum, second_env)
+            concurrent_rollback = subprocess.run(
+                ["bash", str(ROLLBACK)],
+                env=second_env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        finally:
+            Path(blocked_env["BLOCK_RELEASE"]).touch()
+            _, first_stderr = first_update.communicate(timeout=10)
+
+        self.assertEqual(first_update.returncode, 0, first_stderr)
+        self.assertIsNotNone(second_update)
+        self.assertNotEqual(second_update.returncode, 0)
+        self.assertIn("another DevCore install or rollback is active", second_update.stderr)
+        self.assertIsNotNone(concurrent_rollback)
+        self.assertNotEqual(concurrent_rollback.returncode, 0)
+        self.assertIn("another DevCore install or rollback is active", concurrent_rollback.stderr)
+
+        rollback = self.run_rollback()
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertEqual(self.target.read_bytes(), original_bytes)
 
     def test_bad_checksum_leaves_previous_install_unchanged(self):
         original_checksum = self.write_source("1.0.0")
