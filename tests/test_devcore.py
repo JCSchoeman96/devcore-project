@@ -212,7 +212,10 @@ class DevCoreProjectFixture(unittest.TestCase):
             "'demo_test':os.environ.get('DEVCORE_TEST_EXPECTED_TEST_PASSWORD')}\n"
             "if expected.get(role) is not None and os.environ.get('PGPASSWORD') != expected[role]:\n"
             "    raise SystemExit('synthetic authentication rejected')\n"
-            "profile='DEV' if role == 'demo_dev' else 'TEST'\n"
+            "dev_role=os.environ.get('DEVCORE_TEST_DEV_ROLE', 'demo_dev')\n"
+            "test_role=os.environ.get('DEVCORE_TEST_TEST_ROLE', 'demo_test')\n"
+            "if role not in {dev_role, test_role}: raise SystemExit('unexpected mock database role')\n"
+            "profile='DEV' if role == dev_role else 'TEST'\n"
             "prefix='DEVCORE_TEST_DOCTOR_'+profile+'_'\n"
             "get=lambda key, default: os.environ.get(prefix+key, default)\n"
             "createdb='f' if profile == 'DEV' else 't'\n"
@@ -403,6 +406,8 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
                 {
                     "PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"],
                     "DEVCORE_MUTATION_LOCK_HELD": "1",
+                "DEVCORE_TEST_DEV_ROLE": "other_dev",
+                "DEVCORE_TEST_TEST_ROLE": "other_test",
                 }
             )
             second = subprocess.run(
