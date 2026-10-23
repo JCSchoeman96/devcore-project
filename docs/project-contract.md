@@ -10,7 +10,7 @@ The workstation owns `~/.config/dev-core/dev-core.conf` and `~/.config/dev-core/
 
 ## `project.conf`
 
-The v1 parser reads plain `KEY=value` lines. It ignores blank lines and lines whose first non-space character is `#`; it does not evaluate shell syntax. The first matching key wins. These fields define the complete current project-file contract:
+The v1 parser reads plain `KEY=value` lines. It ignores blank lines and lines whose first non-space character is `#`; it does not evaluate shell syntax. The first matching key wins in `.devcore/project.conf`, `dev-core.conf`, and `project-db.env`. These fields define the complete current project-file contract:
 
 | Key | Requirement | Validation or default | Purpose |
 | --- | --- | --- | --- |
@@ -56,7 +56,7 @@ Each non-comment row has three required tab-separated columns and one optional c
 PROFILE<TAB>TEMPLATE<TAB>TARGET<TAB>OPTIONAL_PURGE_KEYS
 ```
 
-`PROFILE` is `dev`, `test`, or `all`. A `run dev` or `run test` command loads files for that profile and rows marked `all`. The invoking shell environment is inherited as well.
+`PROFILE` is `dev`, `test`, or `all`. Render-map validation rejects any other value, and `run PROFILE` exits before starting its child command when given an unsupported value. A `run dev` or `run test` command loads files for that profile and rows marked `all`. The invoking shell environment is inherited as well.
 
 Templates may use these exact tokens. Consumers choose application-specific output variable names around them.
 

@@ -210,6 +210,14 @@ validate_identifier() {
   [[ "$value" =~ ^[a-z][a-z0-9_]{0,62}$ ]] || die "$label must match ^[a-z][a-z0-9_]{0,62}$ (got: $value)"
 }
 
+validate_profile_value() {
+  local label="$1" profile="$2"
+  case "$profile" in
+    dev|test|all) ;;
+    *) die "invalid $label profile: $profile (expected dev, test, or all)" ;;
+  esac
+}
+
 validate_secret_name() {
   local label="$1" value="$2"
   [[ "$value" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "$label is not a valid central secret key: $value"
@@ -262,7 +270,8 @@ for raw in p.read_text().splitlines():
 }
 
 validate_render_row() {
-  local _profile="$1" template="$2" target="$3" _purge="$4"
+  local profile="$1" template="$2" target="$3" _purge="$4"
+  validate_profile_value "render" "$profile"
   [[ -f "$template" ]] || die "missing env template: $template"
   ensure_ignored "$target"
 }
@@ -378,7 +387,8 @@ def parse(path):
     for raw in path.read_text().splitlines():
         line=raw.strip()
         if not line or line.startswith("#") or "=" not in line: continue
-        k,v=line.split("=",1); out[k.strip()]=v.strip()
+        k,v=line.split("=",1); key=k.strip()
+        if key not in out: out[key]=v.strip()
     return out
 p=parse(project_conf); g=parse(global_conf); s=parse(secret_file)
 values={
@@ -469,8 +479,9 @@ db_doctor() {
     result="$(PGPASSWORD="$password" psql -X -qAt -h "$host" -p "$port" -U "$role" -d "$db" \
       -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
   else
-    result="$(docker exec -e PGPASSWORD="$password" "$container" \
-      psql -X -qAt -h 127.0.0.1 -U "$role" -d "$db" \
+    result="$(printf '%s\n' "$password" | docker exec -i "$container" \
+      sh -c 'IFS= read -r PGPASSWORD || exit 1; export PGPASSWORD; exec psql "$@"' \
+      devcore-psql -X -qAt -h 127.0.0.1 -U "$role" -d "$db" \
       -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
   fi
   [[ "$result" == "$role|$db|"* ]] || die "$label PostgreSQL authentication proof failed"
@@ -573,6 +584,7 @@ rotate_all() {
 
 run_profile() {
   local profile="$1"; shift
+  validate_profile_value "run" "$profile"
   [[ "${1-}" == "--" ]] || die "usage: $PROGRAM run PROFILE -- COMMAND [ARGS...]"
   shift
   [[ $# -gt 0 ]] || die "run requires a command"

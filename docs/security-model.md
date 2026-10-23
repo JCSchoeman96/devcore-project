@@ -10,6 +10,8 @@ The renderer writes secret-bearing local environment files with mode `0600`. A c
 
 The CLI disables shell xtrace and rejects secret-handling commands if xtrace is enabled. `plan`, `doctor`, and ordinary errors report secret-key names or presence, not values. Tests use synthetic values and assert that captured command output does not contain them.
 
+When workstation `psql` is unavailable, `doctor` sends the password to the existing container over `docker exec -i` standard input. The container shell exports it for `psql`; the local Docker client's argument vector and temporary files do not contain the password.
+
 ## Database and service boundaries
 
 `activate` may create or alter the configured PostgreSQL owner roles and create their databases. `rotate` changes both configured owner passwords. These operations run only when a workstation user invokes the relevant command. DEV is provisioned without `CREATEDB`; the configured TEST role may use it when the consumer contract says `TEST_ROLE_CREATEDB=yes`.
