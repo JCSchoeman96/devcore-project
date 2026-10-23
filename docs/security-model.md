@@ -10,6 +10,8 @@ The renderer writes secret-bearing local environment files with mode `0600`. A c
 
 The CLI disables shell xtrace and rejects secret-handling commands if xtrace is enabled. `plan`, `doctor`, and ordinary errors report secret-key names or presence, not values. Tests use synthetic values and assert that captured command output does not contain them.
 
+`activate`, `rotate`, and `render` take one nonblocking exclusive lock at `~/.config/dev-core/.devcore-project.lock` before changing workstation state or reading secrets for output. The lock directory must be owned by the current user with mode `0700`. The lock must be a regular, non-symlink file owned by the current user with mode `0600`. A command exits before provisioning or rendering if another mutation holds the lock or if either path fails validation. The operating system releases the lock when its process exits.
+
 When workstation `psql` is unavailable, `doctor` sends the password to the existing container over `docker exec -i` standard input. The container shell exports it for `psql`; the local Docker client's argument vector and temporary files do not contain the password.
 
 ## Database and service boundaries

@@ -1,10 +1,12 @@
 import json
 import os
+import signal
 import shutil
 import socketserver
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -33,6 +35,7 @@ class DevCoreProjectFixture(unittest.TestCase):
         self.project.mkdir()
         self.central = self.home / ".config" / "dev-core"
         self.central.mkdir(parents=True)
+        self.central.chmod(0o700)
         self.secrets = self.central / "project-db.env"
         self.global_conf = self.central / "dev-core.conf"
         self.secrets.write_text(
@@ -82,6 +85,20 @@ class DevCoreProjectFixture(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=15,
+        )
+
+    def start_tool(self, *args, env=None):
+        child_env = self.env()
+        if env:
+            child_env.update(env)
+        return subprocess.Popen(
+            [str(TOOL), *args],
+            cwd=self.project,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
 
     def _write_global_conf(self, dev_port, test_port):
@@ -210,6 +227,223 @@ class DevCoreProjectFixture(unittest.TestCase):
 
 
 class DevCoreBaselineTests(DevCoreProjectFixture):
+    def test_concurrent_activation_rejects_second_mutation_before_role_changes(self):
+        self._start_database_endpoints()
+        self.secrets.write_text("")
+        self.secrets.chmod(0o600)
+        self._install_database_mocks()
+        mock_env, docker_log = self._mock_env()
+        entered = self.root / "docker-entered"
+        release = self.root / "docker-release"
+        docker = self.mock_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args=sys.argv[1:]\n"
+            "if args and args[0]=='inspect': print('true')\n"
+            "elif args and args[0]=='exec':\n"
+            "    if '-qAt' in args:\n"
+            "        index=args.index('-v'); db=args[index+1].removeprefix('db=')\n"
+            "        print({'demo_dev':'demo_dev','demo_test':'demo_test'}.get(db, 'unknown'))\n"
+            "    else:\n"
+            f"        open({str(entered)!r}, 'w').close()\n"
+            f"        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n"
+            "        with open(os.environ['DEVCORE_TEST_DOCKER_LOG'], 'a') as stream: stream.write('provision\\n')\n"
+            "else: raise SystemExit(2)\n"
+        )
+        docker.chmod(0o700)
+        first = self.start_tool("activate", env=mock_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first activation did not reach provisioning")
+            before = self.secrets.read_bytes()
+            second_process = self.start_tool("activate", env=mock_env)
+            try:
+                second_stdout, second_stderr = second_process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(second_process.pid, signal.SIGKILL)
+                second_process.communicate(timeout=5)
+                self.fail("contending activation did not stop promptly")
+            second = subprocess.CompletedProcess(
+                second_process.args, second_process.returncode, second_stdout, second_stderr
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            self.assertEqual(self.secrets.read_bytes(), before)
+            self.assertEqual(
+                docker_log.read_text().splitlines() if docker_log.exists() else [], []
+            )
+            self.assertEqual(
+                set(line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()),
+                {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"},
+            )
+        finally:
+            release.touch()
+            stdout, stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        log_text = docker_log.read_text()
+        self.assertEqual(len(log_text.splitlines()), 2)
+        for line in self.secrets.read_text().splitlines():
+            value = line.split("=", 1)[1]
+            self.assertNotIn(value, stdout + stderr + log_text)
+
+    def test_mutation_lock_is_released_when_owner_process_dies(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        mock_env, _docker_log = self._mock_env()
+        entered = self.root / "docker-entered"
+        release = self.root / "docker-release"
+        docker = self.mock_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args=sys.argv[1:]\n"
+            "if args and args[0]=='inspect': print('true')\n"
+            "elif args and args[0]=='exec':\n"
+            "    if '-qAt' in args:\n"
+            "        index=args.index('-v'); db=args[index+1].removeprefix('db=')\n"
+            "        print({'demo_dev':'demo_dev','demo_test':'demo_test'}.get(db, 'unknown'))\n"
+            "    elif not os.path.exists(" + repr(str(entered)) + "):\n"
+            f"        open({str(entered)!r}, 'w').close()\n"
+            f"        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n"
+            "else: raise SystemExit(2)\n"
+        )
+        docker.chmod(0o700)
+        owner = self.start_tool("activate", env=mock_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "lock owner did not reach provisioning")
+            os.killpg(owner.pid, signal.SIGKILL)
+            owner.communicate(timeout=5)
+            release.touch()
+            retry = self.run_tool("activate", env=mock_env)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+        finally:
+            release.touch()
+            if owner.poll() is None:
+                os.killpg(owner.pid, signal.SIGKILL)
+                owner.communicate(timeout=5)
+
+    def test_concurrent_projects_do_not_lose_shared_secret_store_updates(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        self.secrets.write_text("")
+        self.secrets.chmod(0o600)
+        other = self.root / "other-project"
+        other.mkdir()
+        shutil.copytree(self.project / ".devcore", other / ".devcore")
+        (other / ".gitignore").write_text((self.project / ".gitignore").read_text())
+        other_conf = other / ".devcore" / "project.conf"
+        config = other_conf.read_text()
+        config = config.replace("PROJECT_KEY=demo", "PROJECT_KEY=other")
+        config = config.replace("DEV_DB_ROLE=demo_dev", "DEV_DB_ROLE=other_dev")
+        config = config.replace("DEV_DB_NAME=demo_dev", "DEV_DB_NAME=other_dev")
+        config = config.replace("TEST_DB_ROLE=demo_test", "TEST_DB_ROLE=other_test")
+        config = config.replace("TEST_DB_NAME=demo_test", "TEST_DB_NAME=other_test")
+        config = config.replace("DEV_SECRET_KEY=DEMO_DEV_DB_PASSWORD", "DEV_SECRET_KEY=OTHER_DEV_DB_PASSWORD")
+        config = config.replace("TEST_SECRET_KEY=DEMO_TEST_DB_PASSWORD", "TEST_SECRET_KEY=OTHER_TEST_DB_PASSWORD")
+        config = config.replace("REDIS_PREFIX=demo", "REDIS_PREFIX=other")
+        other_conf.write_text(config)
+        subprocess.run(
+            ["git", "-c", "init.defaultBranch=main", "init", "-q"],
+            cwd=other,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        entered = self.root / "shared-docker-entered"
+        release = self.root / "shared-docker-release"
+        docker_log = self.root / "shared-docker.log"
+        docker = self.mock_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args=sys.argv[1:]\n"
+            "if args and args[0]=='inspect': print('true')\n"
+            "elif args and args[0]=='exec':\n"
+            "    if '-qAt' in args:\n"
+            "        index=args.index('-v'); db=args[index+1].removeprefix('db='); print(db)\n"
+            "    else:\n"
+            f"        open({str(entered)!r}, 'w').close()\n"
+            f"        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n"
+            f"        open({str(docker_log)!r}, 'a').write('provision\\n')\n"
+            "else: raise SystemExit(2)\n"
+        )
+        docker.chmod(0o700)
+        first_env = self.env()
+        first_env.update({"PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"]})
+        first = subprocess.Popen(
+            [str(TOOL), "activate"], cwd=self.project, env=first_env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first project did not reach provisioning")
+            other_env = self.env()
+            other_env.update(
+                {
+                    "PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"],
+                    "DEVCORE_MUTATION_LOCK_HELD": "1",
+                }
+            )
+            second = subprocess.run(
+                [str(TOOL), "activate"], cwd=other, env=other_env,
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            keys = {line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()}
+            self.assertEqual(keys, {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"})
+            self.assertFalse(docker_log.exists(), "contending project reached role provisioning")
+            self.assertNotIn(DEV_PASSWORD, second.stdout + second.stderr)
+            self.assertNotIn(TEST_PASSWORD, second.stdout + second.stderr)
+        finally:
+            release.touch()
+            if first.poll() is None:
+                try:
+                    stdout, stderr = first.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(first.pid, signal.SIGKILL)
+                    stdout, stderr = first.communicate(timeout=5)
+            else:
+                stdout, stderr = first.communicate(timeout=5)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        keys = {line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()}
+        self.assertEqual(keys, {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"})
+        log_text = docker_log.read_text()
+        for line in self.secrets.read_text().splitlines():
+            value = line.split("=", 1)[1]
+            self.assertNotIn(value, stdout + stderr + log_text)
+
+    def test_mutation_lock_rejects_symlink_and_unsafe_mode(self):
+        lock = self.central / ".devcore-project.lock"
+        target = self.root / "outside-lock"
+        target.write_text("unchanged\n")
+        lock.symlink_to(target)
+        symlink_result = self.run_tool("render")
+        self.assertNotEqual(symlink_result.returncode, 0)
+        self.assertIn("lock", symlink_result.stderr.lower())
+        self.assertEqual(target.read_text(), "unchanged\n")
+        lock.unlink()
+        lock.touch(mode=0o644)
+        lock.chmod(0o644)
+        mode_result = self.run_tool("render")
+        self.assertNotEqual(mode_result.returncode, 0)
+        self.assertIn("lock", mode_result.stderr.lower())
+        lock.chmod(0o600)
+        self.central.chmod(0o755)
+        parent_result = self.run_tool("render")
+        self.assertNotEqual(parent_result.returncode, 0)
+        self.assertIn("central config directory", parent_result.stderr)
+
     def test_repository_owned_version_is_reported(self):
         result = self.run_tool("version")
         self.assertEqual(result.returncode, 0, result.stderr)

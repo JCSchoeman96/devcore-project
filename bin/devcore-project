@@ -910,6 +910,90 @@ os.execvpe(cmd[0],cmd,env)
 ' "$profile" "$RENDER_MAP" "${SUPPLEMENTAL_SECRETS:-}" "$CENTRAL_SECRETS" "$@"
 }
 
+acquire_mutation_lock() {
+  python3 -c '
+import fcntl, os, stat, sys
+from pathlib import Path
+
+central = Path(sys.argv[1]).expanduser()
+script = str(Path(sys.argv[2]).resolve(strict=True))
+command = sys.argv[3]
+args = sys.argv[4:]
+directory_fd = -1
+fd = -1
+try:
+    central.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(central, directory_flags)
+    parent = os.fstat(directory_fd)
+    if not stat.S_ISDIR(parent.st_mode):
+        raise RuntimeError("central config path must be a real directory")
+    if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
+        raise RuntimeError("central config directory must be owned by this user with mode 0700")
+
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_name = ".devcore-project.lock"
+    fd = os.open(lock_name, flags, 0o600, dir_fd=directory_fd)
+    lock = os.fstat(fd)
+    current = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(lock.st_mode):
+        raise RuntimeError("mutation lock must be a regular file, not a symlink")
+    if (lock.st_dev, lock.st_ino) != (current.st_dev, current.st_ino):
+        raise RuntimeError("mutation lock changed during validation")
+    if lock.st_uid != os.getuid() or stat.S_IMODE(lock.st_mode) != 0o600:
+        raise RuntimeError("mutation lock must be owned by this user with mode 0600")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError("another DevCore mutation holds the workstation lock")
+    os.close(directory_fd)
+    directory_fd = -1
+    os.set_inheritable(fd, True)
+    os.environ["DEVCORE_MUTATION_LOCK_FD"] = str(fd)
+    os.execv(script, [script, command, *args])
+except (OSError, RuntimeError) as error:
+    raise SystemExit(f"ERROR: cannot acquire mutation lock: {error}")
+finally:
+    if directory_fd >= 0:
+        os.close(directory_fd)
+    if fd >= 0:
+        os.close(fd)
+' "$CENTRAL_DIR" "$0" "$1" "${@:2}"
+  exit $?
+}
+
+validate_inherited_mutation_lock() {
+  python3 -c '
+import fcntl, os, stat, sys
+from pathlib import Path
+
+central = Path(sys.argv[1]).expanduser()
+try:
+    fd = int(os.environ["DEVCORE_MUTATION_LOCK_FD"])
+    parent = central.lstat()
+    lock_path = central / ".devcore-project.lock"
+    lock = os.fstat(fd)
+    current = lock_path.lstat()
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+        raise RuntimeError("central config path must be a real directory")
+    if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
+        raise RuntimeError("central config directory must be owned by this user with mode 0700")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(lock.st_mode):
+        raise RuntimeError("mutation lock must be a regular file, not a symlink")
+    if (lock.st_dev, lock.st_ino) != (current.st_dev, current.st_ino):
+        raise RuntimeError("inherited mutation lock descriptor does not match the lock file")
+    if lock.st_uid != os.getuid() or stat.S_IMODE(lock.st_mode) != 0o600:
+        raise RuntimeError("mutation lock must be owned by this user with mode 0600")
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (OSError, RuntimeError, ValueError, KeyError) as error:
+    raise SystemExit(f"ERROR: invalid inherited mutation lock: {error}")
+' "$CENTRAL_DIR"
+}
+
 cmd_init() {
   local project_key="" dev_role="" dev_db="" test_role="" test_db=""
   local redis_prefix="" dev_secret_key="" test_secret_key="" test_createdb="yes" use_redis="yes"
@@ -996,6 +1080,15 @@ EOF_README
 main() {
   need_cmd python3
   local cmd="${1-help}"; shift || true
+  case "$cmd" in
+    activate|rotate|render)
+      if [[ -n "${DEVCORE_MUTATION_LOCK_FD:-}" ]]; then
+        validate_inherited_mutation_lock
+      else
+        acquire_mutation_lock "$cmd" "$@"
+      fi
+      ;;
+  esac
   case "$cmd" in
     help|-h|--help) usage ;;
     version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;

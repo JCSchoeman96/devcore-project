@@ -19,6 +19,8 @@ The workstation-local secret file under `~/.config/dev-core/` is the source for 
 - `run PROFILE -- COMMAND` removes declared supplemental variables from the parent environment, adds the rendered files for `PROFILE` and `all`, applies declared supplemental secrets from the workstation store, then replaces itself with the requested command.
 - `rotate` rotates both owner credentials, synchronizes the configured database roles, re-renders local files, and checks connectivity.
 
+`activate`, `rotate`, and `render` acquire the same nonblocking workstation lock under `CENTRAL_DIR`. This serializes secret-store updates and keeps `render` from reading DEV and TEST values across two separate replacements during rotation. The lock descriptor remains open through the command and the operating system releases it when the process exits.
+
 The tool calls `docker exec` for existing PostgreSQL/Redis containers when required. It does not manage container lifecycle. Shared service ownership remains with the workstation infrastructure owner.
 
 ## Baseline limits
