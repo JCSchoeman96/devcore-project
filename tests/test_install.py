@@ -103,13 +103,61 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
         backups = sorted(self.target.parent.glob("devcore-project.previous.*"))
-        self.assertEqual([backup.name.split(".")[-2] for backup in backups], ["000000000", "000000001"])
+        self.assertEqual([backup.name.split(".")[2] for backup in backups], ["000000000", "000000001"])
         self.assertEqual(backups[0].read_bytes(), synthetic_tool("1.0.0"))
         self.assertEqual(backups[1].read_bytes(), synthetic_tool("1.0.1"))
 
         rollback = self.run_rollback()
         self.assertEqual(rollback.returncode, 0, rollback.stderr)
         self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
+
+    def test_rollback_uses_install_order_when_system_clock_moves_backwards(self):
+        date_bin = self.root / "mock-bin"
+        date_bin.mkdir()
+        date_state = self.root / "date-used"
+        date_command = date_bin / "date"
+        date_command.write_text(
+            '#!/usr/bin/env bash\n'
+            'if [[ ! -e "$DATE_STATE" ]]; then\n'
+            '  : > "$DATE_STATE"\n'
+            '  printf "%s\\n" "20261023T094601.000000000Z"\n'
+            'else\n'
+            '  printf "%s\\n" "20261023T094600.000000000Z"\n'
+            'fi\n'
+        )
+        date_command.chmod(0o700)
+        self.env["PATH"] = f"{date_bin}:{os.environ['PATH']}"
+        self.env["DATE_STATE"] = str(date_state)
+
+        for version in ("1.0.0", "1.0.1", "1.0.2"):
+            checksum = self.write_source(version)
+            result = self.run_installer(version, checksum)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        rollback = self.run_rollback()
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
+
+    def test_install_and_rollback_reject_insecure_existing_lock_file(self):
+        lock_path = self.target.parent / ".devcore-project-operation.lock"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.touch()
+        lock_path.chmod(0o644)
+
+        checksum = self.write_source("1.0.0")
+        install = self.run_installer("1.0.0", checksum)
+        self.assertNotEqual(install.returncode, 0)
+        self.assertIn("operation lock must be owned by the current user with mode 0600", install.stderr)
+        self.assertFalse(self.target.exists())
+
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        backup = self.target.parent / "devcore-project.previous.000000000.20261023T094600.100000000Z.1"
+        backup.write_bytes(synthetic_tool("1.0.0"))
+        backup.chmod(0o700)
+        rollback = self.run_rollback()
+        self.assertNotEqual(rollback.returncode, 0)
+        self.assertIn("operation lock must be owned by the current user with mode 0600", rollback.stderr)
+        self.assertFalse(self.target.exists())
 
     def test_concurrent_install_and_rollback_are_rejected(self):
         original_checksum = self.write_source("1.0.0")
@@ -247,13 +295,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o700)
         self.assertEqual(len(list(self.target.parent.glob("devcore-project.rolled-back.*"))), 1)
 
-    def test_rollback_uses_timestamp_before_pid_when_updates_share_a_second(self):
+    def test_rollback_uses_install_sequence_before_timestamp_and_pid(self):
         self.target.parent.mkdir(parents=True)
         self.target.write_bytes(synthetic_tool("1.0.2"))
         self.target.chmod(0o700)
 
-        older = self.target.parent / "devcore-project.previous.20261023T094600.100000000Z.000000000.99999"
-        newer = self.target.parent / "devcore-project.previous.20261023T094600.100000001Z.000000000.1"
+        older = self.target.parent / "devcore-project.previous.000000000.20261023T094600.100000000Z.99999"
+        newer = self.target.parent / "devcore-project.previous.000000001.20261023T094600.100000001Z.1"
         older.write_bytes(synthetic_tool("1.0.0"))
         newer.write_bytes(synthetic_tool("1.0.1"))
         older.chmod(0o700)
@@ -263,13 +311,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(rollback.returncode, 0, rollback.stderr)
         self.assertEqual(self.target.read_bytes(), synthetic_tool("1.0.1"))
 
-    def test_rollback_uses_sequence_when_backup_timestamps_match(self):
+    def test_rollback_uses_install_sequence_when_backup_timestamps_match(self):
         self.target.parent.mkdir(parents=True)
         self.target.write_bytes(synthetic_tool("1.0.2"))
         self.target.chmod(0o700)
 
-        older = self.target.parent / "devcore-project.previous.20261023T094600.100000000Z.000000000.99999"
-        newer = self.target.parent / "devcore-project.previous.20261023T094600.100000000Z.000000001.1"
+        older = self.target.parent / "devcore-project.previous.000000000.20261023T094600.100000000Z.99999"
+        newer = self.target.parent / "devcore-project.previous.000000001.20261023T094600.100000000Z.1"
         older.write_bytes(synthetic_tool("1.0.0"))
         newer.write_bytes(synthetic_tool("1.0.1"))
         older.chmod(0o700)

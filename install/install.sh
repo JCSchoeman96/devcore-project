@@ -58,6 +58,7 @@ done
 command -v sha256sum >/dev/null 2>&1 || die "required command not found: sha256sum"
 command -v install >/dev/null 2>&1 || die "required command not found: install"
 command -v flock >/dev/null 2>&1 || die "required command not found: flock"
+command -v stat >/dev/null 2>&1 || die "required command not found: stat"
 
 home_real="$(cd -- "$HOME" && pwd -P)" || die "cannot resolve HOME"
 local_dir="$HOME/.local"
@@ -80,6 +81,9 @@ if [[ -e "$operation_lock" && ! -f "$operation_lock" ]]; then
 fi
 exec {operation_lock_fd}>>"$operation_lock" || die "cannot open the DevCore operation lock"
 flock -n "$operation_lock_fd" || die "another DevCore install or rollback is active"
+operation_lock_mode="$(stat -c '%a' -- "$operation_lock")" || die "cannot inspect the DevCore operation lock"
+[[ -O "$operation_lock" && "$operation_lock_mode" == 600 ]] || \
+  die "operation lock must be owned by the current user with mode 0600"
 
 if [[ -L "$target" ]]; then
   die "refusing to replace a symlink at the install target"
@@ -119,24 +123,21 @@ if [[ -e "$target" ]]; then
   [[ "$backup_stamp" =~ ^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z$ ]] || die "date did not provide a nanosecond UTC timestamp"
 
   backup_sequence=0
-  backup_prefix="devcore-project.previous.$backup_stamp."
   shopt -s nullglob
-  matching_backups=("$install_dir_real/$backup_prefix"*)
+  existing_backups=("$install_dir_real"/devcore-project.previous.*)
   shopt -u nullglob
-  for candidate in "${matching_backups[@]}"; do
+  for candidate in "${existing_backups[@]}"; do
     candidate_name="${candidate##*/}"
-    [[ "$candidate_name" == "$backup_prefix"* ]] || continue
-    candidate_suffix="${candidate_name#"$backup_prefix"}"
-    if [[ "$candidate_suffix" =~ ^([0-9]{9})\.[0-9]+$ ]]; then
+    if [[ "$candidate_name" =~ ^devcore-project\.previous\.([0-9]{9})\.[0-9]{8}T[0-9]{6}\.[0-9]{9}Z\.[0-9]+$ ]]; then
       candidate_sequence=$((10#${BASH_REMATCH[1]}))
       if ((candidate_sequence >= backup_sequence)); then
         backup_sequence=$((candidate_sequence + 1))
       fi
     fi
   done
-  ((backup_sequence <= 999999999)) || die "backup sequence is exhausted for this timestamp"
+  ((backup_sequence <= 999999999)) || die "global backup sequence is exhausted"
   printf -v backup_sequence_text '%09d' "$backup_sequence"
-  backup_path="$install_dir_real/$backup_prefix$backup_sequence_text.$$"
+  backup_path="$install_dir_real/devcore-project.previous.$backup_sequence_text.$backup_stamp.$$"
   [[ ! -e "$backup_path" && ! -L "$backup_path" ]] || die "backup path already exists"
   mv -- "$backup_temp" "$backup_path" || die "cannot save previous executable"
   backup_temp=""

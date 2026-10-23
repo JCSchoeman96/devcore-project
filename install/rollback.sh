@@ -15,6 +15,7 @@ fi
 [[ "${EUID:-0}" -ne 0 ]] || die "run rollback as the target user, without root"
 command -v install >/dev/null 2>&1 || die "required command not found: install"
 command -v flock >/dev/null 2>&1 || die "required command not found: flock"
+command -v stat >/dev/null 2>&1 || die "required command not found: stat"
 
 home_real="$(cd -- "$HOME" && pwd -P)" || die "cannot resolve HOME"
 local_dir="$HOME/.local"
@@ -36,6 +37,9 @@ if [[ -e "$operation_lock" && ! -f "$operation_lock" ]]; then
 fi
 exec {operation_lock_fd}>>"$operation_lock" || die "cannot open the DevCore operation lock"
 flock -n "$operation_lock_fd" || die "another DevCore install or rollback is active"
+operation_lock_mode="$(stat -c '%a' -- "$operation_lock")" || die "cannot inspect the DevCore operation lock"
+[[ -O "$operation_lock" && "$operation_lock_mode" == 600 ]] || \
+  die "operation lock must be owned by the current user with mode 0600"
 
 if [[ -L "$target" ]]; then
   die "refusing to replace a symlink at the install target"
@@ -51,11 +55,11 @@ shopt -u nullglob
 backup=""
 for candidate in "${backups[@]}"; do
   candidate_name="${candidate##*/}"
-  [[ "$candidate_name" =~ ^devcore-project\.previous\.[0-9]{8}T[0-9]{6}\.[0-9]{9}Z\.[0-9]{9}\.[0-9]+$ ]] || continue
+  [[ "$candidate_name" =~ ^devcore-project\.previous\.[0-9]{9}\.[0-9]{8}T[0-9]{6}\.[0-9]{9}Z\.[0-9]+$ ]] || continue
   [[ -f "$candidate" && ! -L "$candidate" ]] || continue
   [[ -z "$backup" || "$candidate" > "$backup" ]] && backup="$candidate"
 done
-[[ -n "$backup" && -f "$backup" && ! -L "$backup" ]] || die "no timestamped previous executable is available"
+[[ -n "$backup" && -f "$backup" && ! -L "$backup" ]] || die "no sequenced previous executable is available"
 
 source_version="$(awk -F'"' '/^VERSION="/ { print $2; found=1; exit } END { if (!found) exit 1 }' "$backup")" || \
   die "previous executable does not declare a VERSION"
