@@ -271,6 +271,35 @@ class PostgresIntegrationTests(unittest.TestCase):
         rendered.write_text(rendered.read_text().replace("TEST_DATABASE_NAME=integration_test", "TEST_DATABASE_NAME=wrong_db"))
         self._tool("doctor", expected=1)
 
+    def test_doctor_detects_role_membership_drift_in_both_directions(self):
+        secrets_file = self.central / "project-db.env"
+        secrets_file.write_text(
+            f"INTEGRATION_DEV_DB_PASSWORD={self.dev_password}\n"
+            f"INTEGRATION_TEST_DB_PASSWORD={self.test_password}\n"
+        )
+        secrets_file.chmod(0o600)
+        self._tool("activate")
+        self._tool("doctor")
+
+        container = self.container_names[0]
+        self._docker_psql(container, "CREATE ROLE membership_drift;")
+        try:
+            for sql, revoke in (
+                ("GRANT membership_drift TO integration_dev;", "REVOKE membership_drift FROM integration_dev;"),
+                ("GRANT integration_dev TO membership_drift;", "REVOKE integration_dev FROM membership_drift;"),
+            ):
+                self._docker_psql(container, sql)
+                self._tool("doctor", expected=1)
+                self._docker_psql(container, revoke)
+                self._tool("doctor")
+        finally:
+            self._docker_psql(
+                container,
+                "REVOKE membership_drift FROM integration_dev; "
+                "REVOKE integration_dev FROM membership_drift; "
+                "DROP ROLE IF EXISTS membership_drift;",
+                check=False,
+            )
     def _assert_database_invariants(self, container, role, createdb):
         query = (
             "SELECT r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole, "
