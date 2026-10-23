@@ -227,7 +227,7 @@ class DevCoreProjectFixture(unittest.TestCase):
 
 
 class DevCoreBaselineTests(DevCoreProjectFixture):
-    def test_concurrent_activation_rejects_second_mutation_before_role_changes(self):
+    def test_concurrent_mutations_stop_before_secret_or_role_changes(self):
         self._start_database_endpoints()
         self.secrets.write_text("")
         self.secrets.chmod(0o600)
@@ -259,22 +259,22 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
                 time.sleep(0.01)
             self.assertTrue(entered.exists(), "first activation did not reach provisioning")
             before = self.secrets.read_bytes()
-            second_process = self.start_tool("activate", env=mock_env)
-            try:
-                second_stdout, second_stderr = second_process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(second_process.pid, signal.SIGKILL)
-                second_process.communicate(timeout=5)
-                self.fail("contending activation did not stop promptly")
-            second = subprocess.CompletedProcess(
-                second_process.args, second_process.returncode, second_stdout, second_stderr
-            )
-            self.assertNotEqual(second.returncode, 0)
-            self.assertIn("mutation lock", second.stderr)
-            self.assertEqual(self.secrets.read_bytes(), before)
-            self.assertEqual(
-                docker_log.read_text().splitlines() if docker_log.exists() else [], []
-            )
+            for command in ("activate", "rotate"):
+                second_process = self.start_tool(command, env=mock_env)
+                try:
+                    second_stdout, second_stderr = second_process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(second_process.pid, signal.SIGKILL)
+                    second_process.communicate(timeout=5)
+                    self.fail(f"contending {command} did not stop promptly")
+                self.assertNotEqual(second_process.returncode, 0)
+                self.assertIn("mutation lock", second_stderr)
+                self.assertEqual(self.secrets.read_bytes(), before)
+                self.assertEqual(
+                    docker_log.read_text().splitlines() if docker_log.exists() else [], []
+                )
+                for line in self.secrets.read_text().splitlines():
+                    self.assertNotIn(line.split("=", 1)[1], second_stdout + second_stderr)
             self.assertEqual(
                 set(line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()),
                 {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"},
@@ -405,6 +405,8 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             self.assertFalse(docker_log.exists(), "contending project reached role provisioning")
             self.assertNotIn(DEV_PASSWORD, second.stdout + second.stderr)
             self.assertNotIn(TEST_PASSWORD, second.stdout + second.stderr)
+            before_retry = self.secrets.read_bytes()
+            first_values = [line.split("=", 1)[1] for line in before_retry.decode().splitlines()]
         finally:
             release.touch()
             if first.poll() is None:
@@ -416,12 +418,30 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             else:
                 stdout, stderr = first.communicate(timeout=5)
         self.assertEqual(first.returncode, 0, stdout + stderr)
-        keys = {line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()}
-        self.assertEqual(keys, {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"})
+        self.assertEqual(self.secrets.read_bytes(), before_retry)
+        first_log = docker_log.read_text()
+        self.assertEqual(len(first_log.splitlines()), 2)
+        for value in first_values:
+            self.assertNotIn(value, stdout + stderr + second.stdout + second.stderr + first_log)
+        retry = subprocess.run(
+            [str(TOOL), "activate"], cwd=other, env=other_env,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        secret_lines = self.secrets.read_text().splitlines()
+        keys = {line.split("=", 1)[0] for line in secret_lines}
+        self.assertEqual(
+            keys,
+            {
+                "DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD",
+                "OTHER_DEV_DB_PASSWORD", "OTHER_TEST_DB_PASSWORD",
+            },
+        )
         log_text = docker_log.read_text()
-        for line in self.secrets.read_text().splitlines():
+        self.assertEqual(len(log_text.splitlines()), 4)
+        for line in secret_lines:
             value = line.split("=", 1)[1]
-            self.assertNotIn(value, stdout + stderr + log_text)
+            self.assertNotIn(value, stdout + stderr + retry.stdout + retry.stderr + log_text)
 
     def test_mutation_lock_rejects_symlink_and_unsafe_mode(self):
         lock = self.central / ".devcore-project.lock"
