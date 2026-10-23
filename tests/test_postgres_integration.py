@@ -290,7 +290,7 @@ class PostgresIntegrationTests(unittest.TestCase):
         for name in getattr(self, "containers", []):
             try:
                 subprocess.run(
-                    ["docker", "rm", "--force", name],
+                    ["docker", "rm", "--force", "--volumes", name],
                     capture_output=True,
                     text=True,
                     timeout=30,
