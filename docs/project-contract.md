@@ -107,7 +107,7 @@ Templates may use these exact tokens. Consumers choose application-specific outp
 
 The renderer rejects unresolved uppercase template tokens. Password tokens resolve only from the local workstation secret store and must be written only to ignored render targets.
 
-Render targets must be ignored by Git. The tool writes them with mode `0600`, replaces its prior managed block, and removes variables named by the optional purge column.
+Render targets must be ignored by Git. The tool writes them with mode `0600`, replaces its prior managed block, and removes variables named by the optional purge column. `doctor` uses the same expected-content computation as `render` and fails when managed output is stale. Unmanaged comments and assignments permitted by the managed-block rules remain intact and do not cause a stale result.
 
 ## Compatibility
 

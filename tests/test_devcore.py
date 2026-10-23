@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import re
 import signal
 import shutil
 import socketserver
@@ -725,6 +727,92 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("DEV PostgreSQL authentication: demo_dev / demo_dev", result.stdout)
         self.assertIn("TEST PostgreSQL authentication: demo_test / demo_test", result.stdout)
+        self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+        self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
+    def test_doctor_rejects_stale_rendered_environment_without_modifying_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        target = self.project / ".env.dev"
+        cases = (
+            ("host", lambda text: re.sub(rb"(?m)^DEV_DATABASE_HOST=.*$", b"DEV_DATABASE_HOST=192.0.2.8", text, count=1)),
+            ("port", lambda text: re.sub(rb"(?m)^DEV_DATABASE_PORT=\d+$", b"DEV_DATABASE_PORT=1", text, count=1)),
+            ("username", lambda text: re.sub(rb"(?m)^DEV_DATABASE_USERNAME=.*$", b"DEV_DATABASE_USERNAME=stale_user", text, count=1)),
+            ("database", lambda text: re.sub(rb"(?m)^DEV_DATABASE_NAME=.*$", b"DEV_DATABASE_NAME=stale_database", text, count=1)),
+            ("password", lambda text: text.replace(
+                f"DEV_DATABASE_PASSWORD={DEV_PASSWORD}".encode(),
+                b"DEV_DATABASE_PASSWORD=STALE_RENDERED_PASSWORD",
+                1,
+            )),
+            ("required managed key", lambda text: re.sub(
+                rb"(?m)^DEV_DATABASE_USERNAME=.*\n", b"", text, count=1
+            )),
+        )
+
+        for label, mutate in cases:
+            with self.subTest(field=label):
+                rendered = self.run_tool("render", env=env)
+                self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                correct = target.read_bytes()
+                mutated = mutate(correct)
+                self.assertNotEqual(
+                    hashlib.sha256(mutated).digest(),
+                    hashlib.sha256(correct).digest(),
+                )
+                target.write_bytes(mutated)
+                before_hash = hashlib.sha256(target.read_bytes()).digest()
+
+                result = self.run_tool("doctor", env=env)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(".env.dev", result.stderr)
+                self.assertIn("stale", result.stderr.lower())
+                self.assertEqual(
+                    hashlib.sha256(target.read_bytes()).digest(),
+                    before_hash,
+                    "doctor modified the rendered target",
+                )
+                self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
+    def test_doctor_allows_unmanaged_rendered_content_without_mutating_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        target = self.project / ".env.dev"
+        target.write_bytes(
+            b"# local unmanaged comment\nLOCAL_ONLY_SETTING=preserved\n"
+            + target.read_bytes()
+        )
+        rendered = self.run_tool("render", env=env)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        rendered_bytes = target.read_bytes()
+        self.assertIn(b"# local unmanaged comment\n", rendered_bytes)
+        self.assertIn(b"LOCAL_ONLY_SETTING=preserved\n", rendered_bytes)
+
+        result = self.run_tool("doctor", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), hashlib.sha256(rendered_bytes).digest())
+        self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+        self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
+    def test_doctor_rejects_stale_test_rendered_password_without_modifying_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        target = self.project / ".env.test"
+        correct = target.read_bytes()
+        mutated = correct.replace(
+            f"TEST_DATABASE_PASSWORD={TEST_PASSWORD}".encode(),
+            b"TEST_DATABASE_PASSWORD=STALE_RENDERED_PASSWORD",
+            1,
+        )
+        self.assertNotEqual(hashlib.sha256(mutated).digest(), hashlib.sha256(correct).digest())
+        target.write_bytes(mutated)
+        before_hash = hashlib.sha256(target.read_bytes()).digest()
+
+        result = self.run_tool("doctor", env=env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env.test", result.stderr)
+        self.assertIn("stale", result.stderr.lower())
+        self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), before_hash)
         self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
         self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
 

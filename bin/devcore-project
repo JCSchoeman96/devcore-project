@@ -540,16 +540,16 @@ provision_all() {
   pass "TEST PostgreSQL role/database ready: $TEST_DB_ROLE / $TEST_DB_NAME"
 }
 
-render_one() {
-  local profile="$1" template="$2" target="$3" purge="$4"
-  ensure_ignored "$target"
+render_target() {
+  local action="$1" profile="$2" template="$3" target="$4" purge="$5"
   python3 -c '
 from pathlib import Path
 import os,re,sys,tempfile
-project_conf=Path(sys.argv[1]); global_conf=Path(sys.argv[2]); secret_file=Path(sys.argv[3])
-template=Path(sys.argv[4]); target=Path(sys.argv[5]); purge_arg=sys.argv[6]
-supplemental_map=sys.argv[7] if len(sys.argv)>7 else ""
-render_profile=sys.argv[8] if len(sys.argv)>8 else ""
+action=sys.argv[1]
+project_conf=Path(sys.argv[2]); global_conf=Path(sys.argv[3]); secret_file=Path(sys.argv[4])
+template=Path(sys.argv[5]); target=Path(sys.argv[6]); purge_arg=sys.argv[7]
+supplemental_map=sys.argv[8] if len(sys.argv)>8 else ""
+render_profile=sys.argv[9] if len(sys.argv)>9 else ""
 
 def parse(path):
     out={}
@@ -644,19 +644,33 @@ for raw in existing.splitlines():
     if probe and not probe.startswith("#") and "=" in probe and probe.split("=",1)[0].strip() in remove:
         continue
     kept.append(raw)
-text="\n".join(kept).rstrip()
-if text: text += "\n\n"
-text += block+"\n"
-target.parent.mkdir(parents=True,exist_ok=True)
-fd,tmp=tempfile.mkstemp(prefix=f".{target.name}.",dir=str(target.parent),text=True)
-try:
-    with os.fdopen(fd,"w") as f:
-        f.write(text); f.flush(); os.fsync(f.fileno())
-    os.chmod(tmp,0o600); os.replace(tmp,target)
-finally:
-    if os.path.exists(tmp): os.unlink(tmp)
-os.chmod(target,0o600)
-' "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge" "${SUPPLEMENTAL_SECRETS:-}" "$profile"
+expected_content="\n".join(kept).rstrip()
+if expected_content: expected_content += "\n\n"
+expected_content += block+"\n"
+if action == "check":
+    if not target.is_file():
+        raise SystemExit(f"rendered local env missing: {target}")
+    if target.read_text() != expected_content:
+        raise SystemExit(f"rendered local env stale: {target}")
+elif action == "write":
+    target.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix=f".{target.name}.",dir=str(target.parent),text=True)
+    try:
+        with os.fdopen(fd,"w") as f:
+            f.write(expected_content); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp,0o600); os.replace(tmp,target)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    os.chmod(target,0o600)
+else:
+    raise SystemExit("invalid render operation")
+' "$action" "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge" "${SUPPLEMENTAL_SECRETS:-}" "$profile"
+}
+
+render_one() {
+  local profile="$1" template="$2" target="$3" purge="$4"
+  ensure_ignored "$target"
+  render_target write "$profile" "$template" "$target" "$purge"
   pass "rendered $target ($profile)"
 }
 
@@ -750,11 +764,12 @@ redis_doctor() {
 }
 
 check_local_modes() {
-  local _profile="$1" _template="$2" target="$3" _purge="$4"
+  local profile="$1" template="$2" target="$3" purge="$4"
   [[ -f "$target" ]] || die "rendered local env missing: $target"
   local mode
   mode="$(stat -c '%a' "$target")"
   [[ "$mode" == "600" ]] || die "$target mode is $mode, expected 600"
+  render_target check "$profile" "$template" "$target" "$purge"
 }
 
 doctor_all() {
