@@ -3,7 +3,7 @@ set -euo pipefail
 set +x
 umask 077
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 PROGRAM="devcore-project"
 
 CENTRAL_DIR="${DEVCORE_CONFIG_DIR:-$HOME/.config/dev-core}"
@@ -18,7 +18,7 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-devcore-project v1.0.1
+devcore-project v1.1.0
 
 Reusable local-project bootstrap for the shared dev-core workstation stack.
 
@@ -203,6 +203,173 @@ load_project() {
   USE_REDIS="$(kv_get "$PROJECT_CONF" USE_REDIS yes)"
   REDIS_PREFIX="$(kv_get "$PROJECT_CONF" REDIS_PREFIX "$PROJECT_KEY")"
   RENDER_MAP="$(kv_get "$PROJECT_CONF" RENDER_MAP .devcore/render-map.tsv)"
+  SUPPLEMENTAL_SECRETS="$(kv_get "$PROJECT_CONF" SUPPLEMENTAL_SECRETS)"
+}
+
+supplemental_map_configured() {
+  [[ -n "${SUPPLEMENTAL_SECRETS:-}" ]]
+}
+
+for_each_supplemental_row() {
+  local callback="$1"
+  python3 -c '
+from pathlib import Path
+import sys
+path=Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(f"missing supplemental secrets map: {path}")
+seen=set()
+for raw in path.read_text().splitlines():
+    if not raw.strip() or raw.lstrip().startswith("#"):
+        continue
+    parts=raw.split("\t")
+    if len(parts)!=3:
+        raise SystemExit(
+            "Invalid supplemental-secrets row (need PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY): "
+            + raw
+        )
+    profile,env_var,secret_key=[part.strip() for part in parts]
+    key=(profile,env_var)
+    if key in seen:
+        raise SystemExit(
+            f"duplicate supplemental binding for profile={profile} env_var={env_var}"
+        )
+    seen.add(key)
+    print("\t".join([profile,env_var,secret_key]))
+' "$SUPPLEMENTAL_SECRETS" | while IFS=$'\t' read -r profile env_var secret_key; do
+    "$callback" "$profile" "$env_var" "$secret_key"
+  done
+}
+
+validate_supplemental_env_var() {
+  local env_var="$1"
+  validate_secret_name "supplemental ENV_VAR" "$env_var"
+  case "$env_var" in
+    PROJECT_KEY|DEV_DB_HOST|DEV_DB_PORT|DEV_DB_ROLE|DEV_DB_NAME|DEV_DB_PASSWORD|\
+TEST_DB_HOST|TEST_DB_PORT|TEST_DB_ROLE|TEST_DB_NAME|TEST_DB_PASSWORD|\
+REDIS_DEV_HOST|REDIS_DEV_PORT|REDIS_TEST_HOST|REDIS_TEST_PORT|\
+REDIS_DEV_NAMESPACE|REDIS_TEST_NAMESPACE_BASE)
+      die "supplemental ENV_VAR cannot use reserved render token: $env_var"
+      ;;
+  esac
+}
+
+validate_supplemental_secret_key() {
+  local secret_key="$1"
+  validate_secret_name "supplemental SECRET_KEY" "$secret_key"
+  if [[ "$secret_key" == "$DEV_SECRET_KEY" || "$secret_key" == "$TEST_SECRET_KEY" ]]; then
+    die "supplemental SECRET_KEY cannot reuse owner secret key: $secret_key"
+  fi
+}
+
+validate_supplemental_row() {
+  local profile="$1" env_var="$2" secret_key="$3"
+  validate_profile_value "supplemental" "$profile"
+  validate_supplemental_env_var "$env_var"
+  validate_supplemental_secret_key "$secret_key"
+}
+
+validate_supplemental_value() {
+  local label="$1" value="$2"
+  [[ -n "$value" ]] || die "$label is empty"
+  [[ "$value" =~ ^[A-Za-z0-9._:/+=,@%_-]+$ ]] || \
+    die "$label contains characters outside the portable supplemental literal/token alphabet"
+}
+
+supplemental_profile_applies() {
+  local binding_profile="$1" active_profile="$2"
+  if [[ "$active_profile" == "all" ]]; then
+    [[ "$binding_profile" == "all" ]]
+    return $?
+  fi
+  [[ "$binding_profile" == "$active_profile" || "$binding_profile" == "all" ]]
+}
+
+check_supplemental_ambiguity() {
+  supplemental_map_configured || return 0
+  python3 -c '
+from pathlib import Path
+import sys
+
+def parse_rows(path):
+    rows=[]
+    seen=set()
+    for raw in Path(path).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts=raw.split("\t")
+        if len(parts)!=3:
+            raise SystemExit(
+                "Invalid supplemental-secrets row (need PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY): "
+                + raw
+            )
+        binding_profile,env_var,secret_key=[part.strip() for part in parts]
+        key=(binding_profile,env_var)
+        if key in seen:
+            raise SystemExit(
+                f"duplicate supplemental binding for profile={binding_profile} env_var={env_var}"
+            )
+        seen.add(key)
+        rows.append((binding_profile,env_var,secret_key))
+    return rows
+
+def applies(binding_profile, active_profile):
+    if active_profile=="all":
+        return binding_profile=="all"
+    return binding_profile==active_profile or binding_profile=="all"
+
+rows=parse_rows(sys.argv[1])
+for active_profile in ("dev","test","all"):
+    by_env={}
+    for binding_profile,env_var,secret_key in rows:
+        if not applies(binding_profile, active_profile):
+            continue
+        if env_var in by_env:
+            raise SystemExit(
+                f"ambiguous supplemental env_var {env_var} for profile {active_profile}"
+            )
+        by_env[env_var]=secret_key
+' "$SUPPLEMENTAL_SECRETS"
+}
+
+check_supplemental_contract() {
+  supplemental_map_configured || return 0
+  [[ -f "$SUPPLEMENTAL_SECRETS" ]] || die "missing supplemental secrets map: $SUPPLEMENTAL_SECRETS"
+  for_each_supplemental_row validate_supplemental_row
+  check_supplemental_ambiguity
+}
+
+require_one_supplemental_secret() {
+  local _profile="$1" _env_var="$2" secret_key="$3"
+  local value
+  value="$(kv_get "$CENTRAL_SECRETS" "$secret_key")"
+  [[ -n "$value" ]] || die "missing $secret_key in $CENTRAL_SECRETS; supplemental secret must exist locally"
+  validate_supplemental_value "supplemental secret $secret_key" "$value"
+}
+
+require_supplemental_if_applicable() {
+  local binding_profile="$1" env_var="$2" secret_key="$3"
+  supplemental_profile_applies "$binding_profile" "$_require_supplemental_active_profile" || return 0
+  require_one_supplemental_secret "$binding_profile" "$env_var" "$secret_key"
+}
+
+require_supplemental_secrets_for_profile() {
+  local active_profile="$1"
+  supplemental_map_configured || return 0
+  check_supplemental_contract
+  _require_supplemental_active_profile="$active_profile"
+  for_each_supplemental_row require_supplemental_if_applicable
+}
+
+require_supplemental_secrets() {
+  supplemental_map_configured || return 0
+  check_supplemental_contract
+  for_each_supplemental_row require_one_supplemental_secret
+}
+
+preflight_operational_contract() {
+  check_render_contract
+  require_supplemental_secrets
 }
 
 validate_identifier() {
@@ -240,6 +407,7 @@ validate_project() {
   [[ "$USE_REDIS" == "yes" || "$USE_REDIS" == "no" ]] || die "USE_REDIS must be yes or no"
   [[ "$REDIS_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9:_-]*$ ]] || die "invalid REDIS_PREFIX: $REDIS_PREFIX"
   [[ -f "$RENDER_MAP" ]] || die "missing render map: $RENDER_MAP"
+  check_supplemental_contract
 }
 
 ensure_ignored() {
@@ -380,6 +548,8 @@ from pathlib import Path
 import os,re,sys,tempfile
 project_conf=Path(sys.argv[1]); global_conf=Path(sys.argv[2]); secret_file=Path(sys.argv[3])
 template=Path(sys.argv[4]); target=Path(sys.argv[5]); purge_arg=sys.argv[6]
+supplemental_map=sys.argv[7] if len(sys.argv)>7 else ""
+render_profile=sys.argv[8] if len(sys.argv)>8 else ""
 
 def parse(path):
     out={}
@@ -410,6 +580,44 @@ values={
   "REDIS_DEV_NAMESPACE": p.get("REDIS_PREFIX",p["PROJECT_KEY"])+":dev",
   "REDIS_TEST_NAMESPACE_BASE": p.get("REDIS_PREFIX",p["PROJECT_KEY"])+":test",
 }
+if supplemental_map:
+    rows=[]
+    seen=set()
+    for raw in Path(supplemental_map).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts=raw.split("\t")
+        if len(parts)!=3:
+            raise SystemExit(
+                "Invalid supplemental-secrets row (need PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY): "
+                + raw
+            )
+        binding_profile,env_var,secret_key=[part.strip() for part in parts]
+        key=(binding_profile,env_var)
+        if key in seen:
+            raise SystemExit(
+                f"duplicate supplemental binding for profile={binding_profile} env_var={env_var}"
+            )
+        seen.add(key)
+        rows.append((binding_profile,env_var,secret_key))
+    def applies(binding_profile, active_profile):
+        if active_profile=="all":
+            return binding_profile=="all"
+        return binding_profile==active_profile or binding_profile=="all"
+    by_env={}
+    for binding_profile,env_var,secret_key in rows:
+        if not applies(binding_profile, render_profile):
+            continue
+        if env_var in by_env:
+            raise SystemExit(
+                f"ambiguous supplemental env_var {env_var} for profile {render_profile}"
+            )
+        if secret_key not in s or not s[secret_key]:
+            raise SystemExit(
+                f"missing {secret_key} in {secret_file}; supplemental secret must exist locally"
+            )
+        by_env[env_var]=s[secret_key]
+    values.update(by_env)
 body=template.read_text()
 for k,v in values.items(): body=body.replace("{{"+k+"}}",v)
 left=sorted(set(re.findall(r"\{\{([A-Z0-9_]+)\}\}",body)))
@@ -448,7 +656,7 @@ try:
 finally:
     if os.path.exists(tmp): os.unlink(tmp)
 os.chmod(target,0o600)
-' "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge"
+' "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge" "${SUPPLEMENTAL_SECRETS:-}" "$profile"
   pass "rendered $target ($profile)"
 }
 
@@ -544,6 +752,11 @@ print_plan() {
   printf 'Central secrets: %s\n' "$CENTRAL_SECRETS"
   printf 'DEV secret key:  %s [%s]\n' "$DEV_SECRET_KEY" "$( [[ -n "$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")" ]] && echo present || echo missing )"
   printf 'TEST secret key: %s [%s]\n' "$TEST_SECRET_KEY" "$( [[ -n "$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")" ]] && echo present || echo missing )"
+  if supplemental_map_configured; then
+    printf 'Supplemental secrets map: %s\n' "$SUPPLEMENTAL_SECRETS"
+    printf 'Supplemental bindings:\n'
+    for_each_supplemental_row print_supplemental_row
+  fi
   printf 'Rendered env files:\n'
   python3 -c '
 from pathlib import Path
@@ -555,8 +768,16 @@ for raw in Path(sys.argv[1]).read_text().splitlines():
 ' "$RENDER_MAP"
 }
 
+print_supplemental_row() {
+  local profile="$1" env_var="$2" secret_key="$3"
+  printf '  - profile=%s env_var=%s secret_key=%s [%s]\n' \
+    "$profile" "$env_var" "$secret_key" \
+    "$( [[ -n "$(kv_get "$CENTRAL_SECRETS" "$secret_key")" ]] && echo present || echo missing )"
+}
+
 rotate_all() {
   require_no_xtrace
+  preflight_operational_contract
   local old_dev old_test new_dev new_test
   old_dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
   old_test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
@@ -588,10 +809,71 @@ run_profile() {
   [[ "${1-}" == "--" ]] || die "usage: $PROGRAM run PROFILE -- COMMAND [ARGS...]"
   shift
   [[ $# -gt 0 ]] || die "run requires a command"
+  require_supplemental_secrets_for_profile "$profile"
   python3 -c '
 from pathlib import Path
 import os,sys
-profile=sys.argv[1]; render_map=Path(sys.argv[2]); cmd=sys.argv[3:]
+profile=sys.argv[1]
+render_map=Path(sys.argv[2])
+supplemental_map=sys.argv[3] if len(sys.argv)>3 and sys.argv[3] else ""
+secret_file=Path(sys.argv[4]) if len(sys.argv)>4 and sys.argv[4] else None
+cmd=sys.argv[5:]
+
+def parse_secrets(path):
+    out={}
+    if path is None or not path.exists():
+        return out
+    for raw in path.read_text().splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key,value=line.split("=",1)
+        key=key.strip()
+        if key not in out:
+            out[key]=value.strip()
+    return out
+
+def supplemental_bindings(active_profile):
+    if not supplemental_map:
+        return {}
+    rows=[]
+    seen=set()
+    for raw in Path(supplemental_map).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts=raw.split("\t")
+        if len(parts)!=3:
+            raise SystemExit(
+                "Invalid supplemental-secrets row (need PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY): "
+                + raw
+            )
+        binding_profile,env_var,secret_key=[part.strip() for part in parts]
+        key=(binding_profile,env_var)
+        if key in seen:
+            raise SystemExit(
+                f"duplicate supplemental binding for profile={binding_profile} env_var={env_var}"
+            )
+        seen.add(key)
+        rows.append((binding_profile,env_var,secret_key))
+    secrets=parse_secrets(secret_file)
+    def applies(binding_profile, render_profile):
+        if render_profile=="all":
+            return binding_profile=="all"
+        return binding_profile==render_profile or binding_profile=="all"
+    by_env={}
+    for binding_profile,env_var,secret_key in rows:
+        if not applies(binding_profile, active_profile):
+            continue
+        if env_var in by_env:
+            raise SystemExit(
+                f"ambiguous supplemental env_var {env_var} for profile {active_profile}"
+            )
+        if secret_key not in secrets or not secrets[secret_key]:
+            raise SystemExit(
+                f"missing {secret_key} in {secret_file}; supplemental secret must exist locally"
+            )
+        by_env[env_var]=secrets[secret_key]
+    return by_env
 
 def parse_env(path, env):
     if not path.exists():
@@ -605,14 +887,27 @@ def parse_env(path, env):
             v=v[1:-1]
         env[k]=v
 
+bindings=supplemental_bindings(profile)
+declared_env_vars=set()
+if supplemental_map:
+    for raw in Path(supplemental_map).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts=raw.split("\t")
+        if len(parts)==3:
+            declared_env_vars.add(parts[1].strip())
 env=os.environ.copy()
+for key in declared_env_vars:
+    env.pop(key, None)
 for raw in render_map.read_text().splitlines():
     if not raw.strip() or raw.lstrip().startswith("#"): continue
     parts=raw.split("\t")
     row_profile,target=parts[0].strip(),Path(parts[2].strip())
     if row_profile in ("all",profile): parse_env(target,env)
+for key,value in bindings.items():
+    env[key]=value
 os.execvpe(cmd[0],cmd,env)
-' "$profile" "$RENDER_MAP" "$@"
+' "$profile" "$RENDER_MAP" "${SUPPLEMENTAL_SECRETS:-}" "$CENTRAL_SECRETS" "$@"
 }
 
 cmd_init() {
@@ -720,10 +1015,12 @@ main() {
       case "$cmd" in
         plan)
           print_plan
+          require_supplemental_secrets
           ;;
         activate)
           need_cmd docker
           require_no_xtrace
+          preflight_operational_contract
           ensure_secret_pair
           provision_all
           render_all
@@ -733,15 +1030,18 @@ main() {
         doctor)
           need_cmd docker
           require_secret_pair
+          require_supplemental_secrets
           doctor_all
           ;;
         render)
           require_no_xtrace
           require_secret_pair
+          require_supplemental_secrets
           render_all
           ;;
         rotate)
           need_cmd docker
+          require_no_xtrace
           require_secret_pair
           rotate_all
           ;;

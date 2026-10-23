@@ -4,7 +4,7 @@
 
 Application repositories own only their tracked `.devcore/` declarations and templates. They consume DevCore and do not copy its executable into product code.
 
-The current v1 contract binds one owner secret for DEV and one for TEST. It stores those values in the workstation-local DevCore secret file, renders ignored local environment files, and runs commands with the selected profile. TICK-45 does not add supplemental-secret bindings.
+The contract binds one owner secret for DEV and one for TEST. Optional supplemental-secret bindings (v1.1.0+) deliver additional workstation-local secrets into declared profiles without changing owner provisioning. See [project contract](docs/project-contract.md).
 
 ## Use
 

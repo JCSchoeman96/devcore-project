@@ -213,7 +213,7 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
     def test_repository_owned_version_is_reported(self):
         result = self.run_tool("version")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "devcore-project 1.0.1\n")
+        self.assertEqual(result.stdout, "devcore-project 1.1.0\n")
 
     def test_plan_parses_contract_and_reports_only_secret_presence(self):
         result = self.run_tool("plan")
