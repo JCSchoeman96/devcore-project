@@ -1,6 +1,6 @@
 # Architecture
 
-Status: current canonical implementation baseline for DevCore 1.1.0 (proposed). Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
+Status: current canonical implementation baseline for DevCore `v1.1.0`, released on 2026-10-23 from source commit `60f2ef09e52abca7b20f1572795579a549ba9d61`. Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
 
 ## Ownership
 
@@ -22,6 +22,8 @@ The workstation-local secret file under `~/.config/dev-core/` is the source for 
 `activate`, `rotate`, and `render` acquire the same nonblocking workstation lock under `CENTRAL_DIR`. This serializes secret-store updates and keeps `render` from reading DEV and TEST values across two separate replacements during rotation. The lock descriptor remains open through the command and the operating system releases it when the process exits.
 
 The tool calls `docker exec` for existing PostgreSQL/Redis containers when required. It does not manage container lifecycle. Shared service ownership remains with the workstation infrastructure owner.
+
+The current workstation service names, endpoints, PostgreSQL version, persistence, and authentication settings are recorded in the [workstation stack contract](workstation-stack-contract.md). That contract also records observed differences between the Compose source and active containers. DevCore does not reconcile those differences by changing shared services.
 
 ## Baseline limits
 
