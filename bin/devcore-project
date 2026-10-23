@@ -241,17 +241,109 @@ for raw in path.read_text().splitlines():
   done
 }
 
+validate_supplemental_env_var() {
+  local env_var="$1"
+  validate_secret_name "supplemental ENV_VAR" "$env_var"
+  case "$env_var" in
+    PROJECT_KEY|DEV_DB_HOST|DEV_DB_PORT|DEV_DB_ROLE|DEV_DB_NAME|DEV_DB_PASSWORD|\
+TEST_DB_HOST|TEST_DB_PORT|TEST_DB_ROLE|TEST_DB_NAME|TEST_DB_PASSWORD|\
+REDIS_DEV_HOST|REDIS_DEV_PORT|REDIS_TEST_HOST|REDIS_TEST_PORT|\
+REDIS_DEV_NAMESPACE|REDIS_TEST_NAMESPACE_BASE)
+      die "supplemental ENV_VAR cannot use reserved render token: $env_var"
+      ;;
+  esac
+}
+
+validate_supplemental_secret_key() {
+  local secret_key="$1"
+  validate_secret_name "supplemental SECRET_KEY" "$secret_key"
+  if [[ "$secret_key" == "$DEV_SECRET_KEY" || "$secret_key" == "$TEST_SECRET_KEY" ]]; then
+    die "supplemental SECRET_KEY cannot reuse owner secret key: $secret_key"
+  fi
+}
+
 validate_supplemental_row() {
   local profile="$1" env_var="$2" secret_key="$3"
   validate_profile_value "supplemental" "$profile"
-  validate_secret_name "supplemental ENV_VAR" "$env_var"
-  validate_secret_name "supplemental SECRET_KEY" "$secret_key"
+  validate_supplemental_env_var "$env_var"
+  validate_supplemental_secret_key "$secret_key"
+}
+
+validate_supplemental_value() {
+  local label="$1" value="$2"
+  python3 -c '
+import sys
+label, value = sys.argv[1], sys.argv[2]
+if not value:
+    print(f"ERROR: {label} is empty", file=sys.stderr)
+    sys.exit(1)
+if any(c in value for c in "\n\r\x00"):
+    print(f"ERROR: {label} contains unsupported control characters", file=sys.stderr)
+    sys.exit(1)
+' "$label" "$value"
+}
+
+supplemental_profile_applies() {
+  local binding_profile="$1" active_profile="$2"
+  if [[ "$active_profile" == "all" ]]; then
+    [[ "$binding_profile" == "all" ]]
+    return $?
+  fi
+  [[ "$binding_profile" == "$active_profile" || "$binding_profile" == "all" ]]
+}
+
+check_supplemental_ambiguity() {
+  supplemental_map_configured || return 0
+  python3 -c '
+from pathlib import Path
+import sys
+
+def parse_rows(path):
+    rows=[]
+    seen=set()
+    for raw in Path(path).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts=raw.split("\t")
+        if len(parts)!=3:
+            raise SystemExit(
+                "Invalid supplemental-secrets row (need PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY): "
+                + raw
+            )
+        binding_profile,env_var,secret_key=[part.strip() for part in parts]
+        key=(binding_profile,env_var)
+        if key in seen:
+            raise SystemExit(
+                f"duplicate supplemental binding for profile={binding_profile} env_var={env_var}"
+            )
+        seen.add(key)
+        rows.append((binding_profile,env_var,secret_key))
+    return rows
+
+def applies(binding_profile, active_profile):
+    if active_profile=="all":
+        return binding_profile=="all"
+    return binding_profile==active_profile or binding_profile=="all"
+
+rows=parse_rows(sys.argv[1])
+for active_profile in ("dev","test","all"):
+    by_env={}
+    for binding_profile,env_var,secret_key in rows:
+        if not applies(binding_profile, active_profile):
+            continue
+        if env_var in by_env:
+            raise SystemExit(
+                f"ambiguous supplemental env_var {env_var} for profile {active_profile}"
+            )
+        by_env[env_var]=secret_key
+' "$SUPPLEMENTAL_SECRETS"
 }
 
 check_supplemental_contract() {
   supplemental_map_configured || return 0
   [[ -f "$SUPPLEMENTAL_SECRETS" ]] || die "missing supplemental secrets map: $SUPPLEMENTAL_SECRETS"
   for_each_supplemental_row validate_supplemental_row
+  check_supplemental_ambiguity
 }
 
 require_one_supplemental_secret() {
@@ -259,13 +351,32 @@ require_one_supplemental_secret() {
   local value
   value="$(kv_get "$CENTRAL_SECRETS" "$secret_key")"
   [[ -n "$value" ]] || die "missing $secret_key in $CENTRAL_SECRETS; supplemental secret must exist locally"
-  validate_secret_value "supplemental secret $secret_key" "$value"
+  validate_supplemental_value "supplemental secret $secret_key" "$value"
+}
+
+require_supplemental_if_applicable() {
+  local binding_profile="$1" env_var="$2" secret_key="$3"
+  supplemental_profile_applies "$binding_profile" "$_require_supplemental_active_profile" || return 0
+  require_one_supplemental_secret "$binding_profile" "$env_var" "$secret_key"
+}
+
+require_supplemental_secrets_for_profile() {
+  local active_profile="$1"
+  supplemental_map_configured || return 0
+  check_supplemental_contract
+  _require_supplemental_active_profile="$active_profile"
+  for_each_supplemental_row require_supplemental_if_applicable
 }
 
 require_supplemental_secrets() {
   supplemental_map_configured || return 0
   check_supplemental_contract
   for_each_supplemental_row require_one_supplemental_secret
+}
+
+preflight_operational_contract() {
+  check_render_contract
+  require_supplemental_secrets
 }
 
 validate_identifier() {
@@ -673,6 +784,7 @@ print_supplemental_row() {
 
 rotate_all() {
   require_no_xtrace
+  preflight_operational_contract
   local old_dev old_test new_dev new_test
   old_dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
   old_test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
@@ -704,7 +816,7 @@ run_profile() {
   [[ "${1-}" == "--" ]] || die "usage: $PROGRAM run PROFILE -- COMMAND [ARGS...]"
   shift
   [[ $# -gt 0 ]] || die "run requires a command"
-  require_supplemental_secrets
+  require_supplemental_secrets_for_profile "$profile"
   python3 -c '
 from pathlib import Path
 import os,sys
@@ -783,8 +895,16 @@ def parse_env(path, env):
         env[k]=v
 
 bindings=supplemental_bindings(profile)
+declared_env_vars=set()
+if supplemental_map:
+    for raw in Path(supplemental_map).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        parts=raw.split("\t")
+        if len(parts)==3:
+            declared_env_vars.add(parts[1].strip())
 env=os.environ.copy()
-for key in bindings:
+for key in declared_env_vars:
     env.pop(key, None)
 for raw in render_map.read_text().splitlines():
     if not raw.strip() or raw.lstrip().startswith("#"): continue
@@ -902,12 +1022,13 @@ main() {
       case "$cmd" in
         plan)
           print_plan
+          require_supplemental_secrets
           ;;
         activate)
           need_cmd docker
           require_no_xtrace
+          preflight_operational_contract
           ensure_secret_pair
-          require_supplemental_secrets
           provision_all
           render_all
           doctor_all
@@ -927,6 +1048,7 @@ main() {
           ;;
         rotate)
           need_cmd docker
+          require_no_xtrace
           require_secret_pair
           rotate_all
           ;;

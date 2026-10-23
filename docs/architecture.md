@@ -12,7 +12,7 @@ The workstation-local secret file under `~/.config/dev-core/` is the source for 
 
 ## Command flow
 
-- `plan` parses the project and workstation allocation, then reports non-secret endpoints, role names, output paths, and whether each configured owner secret exists.
+- `plan` parses the project and workstation allocation, reports non-secret endpoints, role names, output paths, and whether each configured owner and supplemental secret exists, then fails closed when any declared supplemental secret is missing.
 - `activate` initializes missing workstation config, creates missing DEV/TEST owner secrets, provisions the configured PostgreSQL roles and databases, renders ignored environment files, and checks configured services.
 - `doctor` validates available credentials and checks configured endpoints. PostgreSQL checks authenticate without changing database state. Redis checks use a short-lived, project-prefixed probe key and remove it.
 - `render` regenerates ignored environment files from the current templates and owner secrets.

@@ -39,11 +39,13 @@ Each non-comment row has three tab-separated columns:
 PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY
 ```
 
-- `PROFILE` is `dev`, `test`, or `all`. A `dev` or `test` binding applies to that profile and to rendered rows for that profile. An `all` binding applies to every `run` profile and only to render-map rows whose profile is `all`.
-- `ENV_VAR` is the output environment variable name (`^[A-Z_][A-Z0-9_]*$`). Templates may reference it as `{{ENV_VAR}}` only when the same variable is declared here.
-- `SECRET_KEY` is the workstation-local secret name (`^[A-Z_][A-Z0-9_]*$`) whose value is delivered.
+- `PROFILE` is `dev`, `test`, or `all`. An `all` binding is shared: it applies to `dev`, `test`, and `all` profile contexts (render rows and `run`). A `dev` or `test` binding applies only to that profile context.
+- `ENV_VAR` is the output environment variable name (`^[A-Z_][A-Z0-9_]*$`). It must not use a reserved canonical render token (`PROJECT_KEY`, `DEV_DB_*`, `TEST_DB_*`, `REDIS_*` namespace tokens). Templates may reference `{{ENV_VAR}}` only when declared here.
+- `SECRET_KEY` is the workstation-local secret name (`^[A-Z_][A-Z0-9_]*$`) whose value is delivered. It must not equal the project's `DEV_SECRET_KEY` or `TEST_SECRET_KEY`.
 
-Duplicate `(PROFILE, ENV_VAR)` rows are rejected. If the same `ENV_VAR` would be supplied by more than one applicable binding for a profile, validation fails closed. Missing declared secrets fail `plan`, `render`, `doctor`, `activate`, and `run` without printing secret values. `run` removes declared supplemental variables from the parent environment before applying governed profile values.
+Supplemental values use a generic delivery contract: non-empty, single-line, with no newline/CR/NUL characters. They are not required to match the generated owner PostgreSQL password shape.
+
+Duplicate `(PROFILE, ENV_VAR)` rows are rejected. If the same `ENV_VAR` would be supplied by more than one applicable binding for an active profile (`dev`, `test`, or `all`), validation fails closed during contract checks. Missing declared secrets fail `plan`, `render`, `doctor`, and `activate` for the full map; `run PROFILE` requires only bindings applicable to `PROFILE`. Secret values are never printed. `run` removes every declared supplemental `ENV_VAR` from the parent environment before loading rendered files and applying bindings for the selected profile.
 
 ### Workstation `dev-core.conf`
 
