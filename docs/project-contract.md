@@ -1,6 +1,6 @@
 # Consumer project contract
 
-Status: current documented v1 consumer contract, preserved by DevCore 1.0.1.
+Status: current documented consumer contract. DevCore 1.0.1 projects remain compatible; 1.1.0 adds optional supplemental-secret delivery.
 
 ## Files a consumer owns
 
@@ -25,8 +25,25 @@ The v1 parser reads plain `KEY=value` lines. It ignores blank lines and lines wh
 | `USE_REDIS` | Optional | `yes` | Whether plan/activate/doctor run the scoped Redis checks; valid values are `yes` and `no`. |
 | `REDIS_PREFIX` | Optional | `PROJECT_KEY` | Prefix for DEV and TEST Redis namespaces; must match `^[A-Za-z0-9][A-Za-z0-9:_-]*$`. |
 | `RENDER_MAP` | Optional | `.devcore/render-map.tsv` | Path to the required tab-separated render map. |
+| `SUPPLEMENTAL_SECRETS` | Optional | unset | Path to the optional tab-separated supplemental-secret binding map. |
 
-`devcore-project init` writes every field, using those same defaults. The project file contains secret names, never secret values. The contract does not include supplemental-secret bindings.
+`devcore-project init` writes every required field, using those same defaults. The project file contains secret names, never secret values.
+
+### Supplemental secrets (1.1.0+)
+
+When `SUPPLEMENTAL_SECRETS` is set, the referenced file declares delivery-only bindings from the workstation secret store into rendered profiles and `run`. DevCore does not generate, rotate, or provision these secrets and does not treat them as owner credentials.
+
+Each non-comment row has three tab-separated columns:
+
+```text
+PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY
+```
+
+- `PROFILE` is `dev`, `test`, or `all`. A `dev` or `test` binding applies to that profile and to rendered rows for that profile. An `all` binding applies to every `run` profile and only to render-map rows whose profile is `all`.
+- `ENV_VAR` is the output environment variable name (`^[A-Z_][A-Z0-9_]*$`). Templates may reference it as `{{ENV_VAR}}` only when the same variable is declared here.
+- `SECRET_KEY` is the workstation-local secret name (`^[A-Z_][A-Z0-9_]*$`) whose value is delivered.
+
+Duplicate `(PROFILE, ENV_VAR)` rows are rejected. If the same `ENV_VAR` would be supplied by more than one applicable binding for a profile, validation fails closed. Missing declared secrets fail `plan`, `render`, `doctor`, `activate`, and `run` without printing secret values. `run` removes declared supplemental variables from the parent environment before applying governed profile values.
 
 ### Workstation `dev-core.conf`
 

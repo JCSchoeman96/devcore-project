@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 (unreleased)
+
+Backward-compatible contract extension for explicit supplemental-secret delivery.
+
+- Add optional `SUPPLEMENTAL_SECRETS` project declaration pointing at a tab-separated binding map: `PROFILE<TAB>ENV_VAR<TAB>SECRET_KEY`.
+- Deliver declared workstation-local secrets into rendered profiles and `run` without generating, rotating, or provisioning owner credentials.
+- Fail closed when a declared supplemental secret is missing; reject duplicate `(profile, env_var)` bindings and ambiguous profile overlap.
+- Scrub declared supplemental variables from the parent shell before `run` applies governed profile values.
+
 ## 1.0.1 (released 2026-10-23)
 
 The first repository-owned baseline adopts the behavior of the installed workstation snapshot, with an explicit version bump and canonical source history.

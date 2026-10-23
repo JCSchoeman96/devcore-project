@@ -1,6 +1,6 @@
 # Architecture
 
-Status: current canonical implementation baseline for DevCore 1.0.1. Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
+Status: current canonical implementation baseline for DevCore 1.1.0 (proposed). Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
 
 ## Ownership
 
@@ -16,13 +16,13 @@ The workstation-local secret file under `~/.config/dev-core/` is the source for 
 - `activate` initializes missing workstation config, creates missing DEV/TEST owner secrets, provisions the configured PostgreSQL roles and databases, renders ignored environment files, and checks configured services.
 - `doctor` validates available credentials and checks configured endpoints. PostgreSQL checks authenticate without changing database state. Redis checks use a short-lived, project-prefixed probe key and remove it.
 - `render` regenerates ignored environment files from the current templates and owner secrets.
-- `run PROFILE -- COMMAND` adds the rendered files for `PROFILE` and `all` to a copy of the invoking environment, then replaces itself with the requested command.
+- `run PROFILE -- COMMAND` removes declared supplemental variables from the parent environment, adds the rendered files for `PROFILE` and `all`, applies declared supplemental secrets from the workstation store, then replaces itself with the requested command.
 - `rotate` rotates both owner credentials, synchronizes the configured database roles, re-renders local files, and checks connectivity.
 
 The tool calls `docker exec` for existing PostgreSQL/Redis containers when required. It does not manage container lifecycle. Shared service ownership remains with the workstation infrastructure owner.
 
 ## Baseline limits
 
-The current contract has one DEV owner-secret binding and one TEST owner-secret binding. TICK-45 does not add supplemental secret delivery or runtime-role configuration. Any expansion must be specified, tested, versioned, and reviewed in this canonical repository before consumers adopt it.
+The contract has one DEV owner-secret binding and one TEST owner-secret binding. Optional supplemental-secret bindings (see [project contract](project-contract.md)) deliver additional workstation-local secrets without owner provisioning. Supplemental secrets are not generated or rotated by DevCore.
 
 No application runtime should copy this executable into product code. The executable is a workstation development tool, not a production credential manager.
