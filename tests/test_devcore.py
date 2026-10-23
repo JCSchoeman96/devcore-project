@@ -210,7 +210,16 @@ class DevCoreProjectFixture(unittest.TestCase):
             "'demo_test':os.environ.get('DEVCORE_TEST_EXPECTED_TEST_PASSWORD')}\n"
             "if expected.get(role) is not None and os.environ.get('PGPASSWORD') != expected[role]:\n"
             "    raise SystemExit('synthetic authentication rejected')\n"
-            "print(f'{role}|{db}|180006')\n"
+            "profile='DEV' if role == 'demo_dev' else 'TEST'\n"
+            "prefix='DEVCORE_TEST_DOCTOR_'+profile+'_'\n"
+            "get=lambda key, default: os.environ.get(prefix+key, default)\n"
+            "createdb='f' if profile == 'DEV' else 't'\n"
+            "fields=[get('CURRENT_USER', role), get('CURRENT_DATABASE', db),\n"
+            "        get('SERVER_VERSION', '180006'), get('OWNER', role),\n"
+            "        get('LOGIN', 't'), get('SUPERUSER', 'f'), get('CREATEDB', createdb),\n"
+            "        get('CREATEROLE', 'f'), get('REPLICATION', 'f'),\n"
+            "        get('BYPASSRLS', 'f'), get('MEMBERSHIP_COUNT', '0')]\n"
+            "print('|'.join(fields))\n"
         )
         psql.chmod(0o700)
 
@@ -659,6 +668,66 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
         self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
 
+    def _rendered_doctor_fixture(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        env, log = self._mock_env()
+        rendered = self.run_tool("render", env=env)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        log.write_text("")
+        return env, log
+
+    def test_doctor_rejects_postgresql_role_and_ownership_drift(self):
+        env, log = self._rendered_doctor_fixture()
+        cases = []
+        for profile in ("DEV", "TEST"):
+            for key, value in (
+                ("CURRENT_USER", "wrong_role"),
+                ("CURRENT_DATABASE", "wrong_database"),
+                ("SERVER_VERSION", "not-a-number"),
+            ):
+                cases.append((profile, key, value))
+            for key, value in (
+                ("LOGIN", "f"),
+                ("SUPERUSER", "t"),
+                ("CREATEROLE", "t"),
+                ("REPLICATION", "t"),
+                ("BYPASSRLS", "t"),
+                ("OWNER", "wrong_owner"),
+                ("MEMBERSHIP_COUNT", "1"),
+            ):
+                cases.append((profile, key, value))
+        cases.extend((("DEV", "CREATEDB", "t"), ("TEST", "CREATEDB", "f")))
+
+        for profile, key, value in cases:
+            with self.subTest(profile=profile, invariant=key, value=value):
+                case_env = dict(env)
+                case_env[f"DEVCORE_TEST_DOCTOR_{profile}_{key}"] = value
+                result = self.run_tool("doctor", env=case_env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invariant", result.stderr.lower())
+                self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn("provision", log.read_text())
+
+    def test_doctor_accepts_test_createdb_no_when_contract_requires_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        project_conf = self.project / ".devcore" / "project.conf"
+        project_conf.write_text(
+            project_conf.read_text().replace("TEST_ROLE_CREATEDB=yes", "TEST_ROLE_CREATEDB=no")
+        )
+        env["DEVCORE_TEST_DOCTOR_TEST_CREATEDB"] = "f"
+        rendered = self.run_tool("render", env=env)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+
+        result = self.run_tool("doctor", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DEV PostgreSQL authentication: demo_dev / demo_dev", result.stdout)
+        self.assertIn("TEST PostgreSQL authentication: demo_test / demo_test", result.stdout)
+        self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+        self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
     def test_missing_secret_fails_without_printing_other_values(self):
         self.secrets.write_text("DEMO_DEV_DB_PASSWORD=" + DEV_PASSWORD + "\n")
         self.secrets.chmod(0o600)
@@ -738,7 +807,8 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             "'demo_test':os.environ['DEVCORE_TEST_EXPECTED_TEST_PASSWORD']}\n"
             "    if password != expected[role]:\n"
             "        raise SystemExit('synthetic authentication rejected')\n"
-            "    print(f'{role}|{db}|180006')\n"
+            "    createdb='f' if role == 'demo_dev' else 't'\n"
+            "    print(f'{role}|{db}|180006|{role}|t|f|{createdb}|f|f|f|0')\n"
             "else:\n"
             "    raise SystemExit(2)\n"
         )

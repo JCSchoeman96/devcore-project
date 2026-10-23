@@ -14,6 +14,8 @@ The CLI disables shell xtrace and rejects secret-handling commands if xtrace is 
 
 When workstation `psql` is unavailable, `doctor` sends the password to the existing container over `docker exec -i` standard input. The container shell exports it for `psql`; the local Docker client's argument vector and temporary files do not contain the password.
 
+The PostgreSQL portion of `doctor` uses an authenticated, read-only query to check role identity, database ownership, privilege flags, and role memberships. DEV must remain NOCREATEDB; TEST `CREATEDB` must match the consumer contract. Neither owner role may have role memberships. Drift is reported without revoking memberships or changing PostgreSQL state.
+
 ## Database and service boundaries
 
 `activate` may create or alter the configured PostgreSQL owner roles and create their databases. `rotate` changes both configured owner passwords. These operations run only when a workstation user invokes the relevant command. DEV is provisioned without `CREATEDB`; the configured TEST role may use it when the consumer contract says `TEST_ROLE_CREATEDB=yes`.

@@ -677,23 +677,51 @@ with socket.create_connection((host,port),timeout=2):
 }
 
 db_doctor() {
-  local label="$1" container="$2" role="$3" db="$4" secret_key="$5" host="$6" port="$7"
+  local label="$1" container="$2" role="$3" db="$4" secret_key="$5" host="$6" port="$7" allow_createdb="$8"
   container_running "$container" || die "$label PostgreSQL container unavailable: $container"
   tcp_check "$label PostgreSQL" "$host" "$port"
   local password result
   password="$(kv_get "$CENTRAL_SECRETS" "$secret_key")"
   validate_secret_value "$label password" "$password"
+  local query="
+SELECT current_user,
+       current_database(),
+       current_setting('server_version_num'),
+       pg_get_userbyid(d.datdba),
+       r.rolcanlogin,
+       r.rolsuper,
+       r.rolcreatedb,
+       r.rolcreaterole,
+       r.rolreplication,
+       r.rolbypassrls,
+       (SELECT count(*)
+          FROM pg_auth_members AS m
+         WHERE m.member = r.oid OR m.roleid = r.oid)
+  FROM pg_roles AS r
+  JOIN pg_database AS d ON d.datname = current_database()
+ WHERE r.rolname = current_user;"
   if command -v psql >/dev/null 2>&1; then
     result="$(PGPASSWORD="$password" psql -X -qAt -h "$host" -p "$port" -U "$role" -d "$db" \
-      -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
+      -F '|' -c "$query")"
   else
     result="$(printf '%s\n' "$password" | docker exec -i "$container" \
       sh -c 'IFS= read -r PGPASSWORD || exit 1; export PGPASSWORD; exec psql "$@"' \
       devcore-psql -X -qAt -h 127.0.0.1 -U "$role" -d "$db" \
-      -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
+      -F '|' -c "$query")"
   fi
-  [[ "$result" == "$role|$db|"* ]] || die "$label PostgreSQL authentication proof failed"
-  pass "$label PostgreSQL authentication: $role / $db"
+  local -a fields
+  IFS='|' read -r -a fields <<< "$result"
+  [[ "${#fields[@]}" -eq 11 && "${fields[2]}" =~ ^[0-9]+$ ]] || \
+    die "$label PostgreSQL invariant query returned an unexpected result"
+  local expected_createdb="f"
+  [[ "$allow_createdb" == "yes" ]] && expected_createdb="t"
+  [[ "${fields[0]}" == "$role" && "${fields[1]}" == "$db" && \
+     "${fields[3]}" == "$role" && "${fields[4]}" == "t" && \
+     "${fields[5]}" == "f" && "${fields[6]}" == "$expected_createdb" && \
+     "${fields[7]}" == "f" && "${fields[8]}" == "f" && \
+     "${fields[9]}" == "f" && "${fields[10]}" == "0" ]] || \
+    die "$label PostgreSQL role, ownership, or membership invariant failed"
+  pass "$label PostgreSQL authentication: $role / $db (server version ${fields[2]})"
 }
 
 redis_doctor() {
@@ -730,8 +758,8 @@ check_local_modes() {
 }
 
 doctor_all() {
-  db_doctor DEV "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$DEV_SECRET_KEY" "$PG_DEV_HOST" "$PG_DEV_PORT"
-  db_doctor TEST "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$TEST_SECRET_KEY" "$PG_TEST_HOST" "$PG_TEST_PORT"
+  db_doctor DEV "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$DEV_SECRET_KEY" "$PG_DEV_HOST" "$PG_DEV_PORT" no
+  db_doctor TEST "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$TEST_SECRET_KEY" "$PG_TEST_HOST" "$PG_TEST_PORT" "$TEST_ROLE_CREATEDB"
   if [[ "$USE_REDIS" == "yes" ]]; then
     redis_doctor DEV "$REDIS_DEV_CONTAINER" "${REDIS_PREFIX}:dev" "$REDIS_DEV_HOST" "$REDIS_DEV_PORT"
     redis_doctor TEST "$REDIS_TEST_CONTAINER" "${REDIS_PREFIX}:test" "$REDIS_TEST_HOST" "$REDIS_TEST_PORT"
