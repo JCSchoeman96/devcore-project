@@ -10,6 +10,8 @@ The contract binds one owner secret for DEV and one for TEST. Optional supplemen
 
 See [installation](docs/installation.md) for the user-local install and update procedure. See [project contract](docs/project-contract.md) before changing a consumer's `.devcore/` files.
 
+See the [workstation stack contract](docs/workstation-stack-contract.md) for shared DEV and TEST endpoints, persistence, authentication, and service ownership.
+
 Common commands from a consumer repository:
 
 ```sh
@@ -29,12 +31,13 @@ The user, JCSchoeman96, created and owns all DevCore materials. This repository 
 
 ## Development
 
-Requirements are Bash, Python 3, and standard Unix command-line utilities. The automated tests use temporary directories, synthetic credentials, and mocked Docker/PostgreSQL commands.
+Requirements are Bash, Python 3, and standard Unix command-line utilities. The fast unittest suite uses temporary directories, synthetic credentials, and mocked Docker/PostgreSQL commands. The opt-in integration suite uses two disposable PostgreSQL 18.6 Alpine containers.
 
 ```sh
 bash -n bin/devcore-project install/install.sh install/rollback.sh
 shellcheck bin/devcore-project install/install.sh install/rollback.sh
 python3 -m unittest discover -s tests -v
+DEVCORE_RUN_POSTGRES_INTEGRATION=1 python3 -m unittest tests.test_postgres_integration -v
 (cd provenance/legacy-v1.0.0 && sha256sum --check SHA256SUMS)
 ```
 

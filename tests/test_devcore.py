@@ -1,10 +1,15 @@
+import hashlib
 import json
 import os
+import pwd
+import re
+import signal
 import shutil
 import socketserver
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -33,6 +38,7 @@ class DevCoreProjectFixture(unittest.TestCase):
         self.project.mkdir()
         self.central = self.home / ".config" / "dev-core"
         self.central.mkdir(parents=True)
+        self.central.chmod(0o700)
         self.secrets = self.central / "project-db.env"
         self.global_conf = self.central / "dev-core.conf"
         self.secrets.write_text(
@@ -71,6 +77,13 @@ class DevCoreProjectFixture(unittest.TestCase):
             "DEVCORE_PROJECT_CONF": ".devcore/project.conf",
         }
 
+    def mutation_lock_path(self, state_path):
+        path = Path(state_path)
+        canonical = path.parent.resolve(strict=False) / path.name
+        digest = hashlib.sha256(os.fsencode(str(canonical))).hexdigest()
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        return account_home / ".config" / "dev-core" / "locks" / f"state-{digest}.lock"
+
     def run_tool(self, *args, env=None):
         child_env = self.env()
         if env:
@@ -82,6 +95,20 @@ class DevCoreProjectFixture(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=15,
+        )
+
+    def start_tool(self, *args, env=None):
+        child_env = self.env()
+        if env:
+            child_env.update(env)
+        return subprocess.Popen(
+            [str(TOOL), *args],
+            cwd=self.project,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
 
     def _write_global_conf(self, dev_port, test_port):
@@ -193,7 +220,19 @@ class DevCoreProjectFixture(unittest.TestCase):
             "'demo_test':os.environ.get('DEVCORE_TEST_EXPECTED_TEST_PASSWORD')}\n"
             "if expected.get(role) is not None and os.environ.get('PGPASSWORD') != expected[role]:\n"
             "    raise SystemExit('synthetic authentication rejected')\n"
-            "print(f'{role}|{db}|180006')\n"
+            "dev_role=os.environ.get('DEVCORE_TEST_DEV_ROLE', 'demo_dev')\n"
+            "test_role=os.environ.get('DEVCORE_TEST_TEST_ROLE', 'demo_test')\n"
+            "if role not in {dev_role, test_role}: raise SystemExit('unexpected mock database role')\n"
+            "profile='DEV' if role == dev_role else 'TEST'\n"
+            "prefix='DEVCORE_TEST_DOCTOR_'+profile+'_'\n"
+            "get=lambda key, default: os.environ.get(prefix+key, default)\n"
+            "createdb='f' if profile == 'DEV' else 't'\n"
+            "fields=[get('CURRENT_USER', role), get('CURRENT_DATABASE', db),\n"
+            "        get('SERVER_VERSION', '180006'), get('OWNER', role),\n"
+            "        get('LOGIN', 't'), get('SUPERUSER', 'f'), get('CREATEDB', createdb),\n"
+            "        get('CREATEROLE', 'f'), get('REPLICATION', 'f'),\n"
+            "        get('BYPASSRLS', 'f'), get('MEMBERSHIP_COUNT', '0')]\n"
+            "print('|'.join(fields))\n"
         )
         psql.chmod(0o700)
 
@@ -210,6 +249,470 @@ class DevCoreProjectFixture(unittest.TestCase):
 
 
 class DevCoreBaselineTests(DevCoreProjectFixture):
+    def test_concurrent_mutations_stop_before_secret_or_role_changes(self):
+        self._start_database_endpoints()
+        self.secrets.write_text("")
+        self.secrets.chmod(0o600)
+        self._install_database_mocks()
+        mock_env, docker_log = self._mock_env()
+        entered = self.root / "docker-entered"
+        release = self.root / "docker-release"
+        docker = self.mock_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args=sys.argv[1:]\n"
+            "if args and args[0]=='inspect': print('true')\n"
+            "elif args and args[0]=='exec':\n"
+            "    if '-qAt' in args:\n"
+            "        index=args.index('-v'); db=args[index+1].removeprefix('db=')\n"
+            "        print({'demo_dev':'demo_dev','demo_test':'demo_test'}.get(db, 'unknown'))\n"
+            "    else:\n"
+            f"        open({str(entered)!r}, 'w').close()\n"
+            f"        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n"
+            "        with open(os.environ['DEVCORE_TEST_DOCKER_LOG'], 'a') as stream: stream.write('provision\\n')\n"
+            "else: raise SystemExit(2)\n"
+        )
+        docker.chmod(0o700)
+        first = self.start_tool("activate", env=mock_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first activation did not reach provisioning")
+            before = self.secrets.read_bytes()
+            for command in ("activate", "rotate", "install"):
+                second_process = self.start_tool(command, env=mock_env)
+                try:
+                    second_stdout, second_stderr = second_process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(second_process.pid, signal.SIGKILL)
+                    second_process.communicate(timeout=5)
+                    self.fail(f"contending {command} did not stop promptly")
+                self.assertNotEqual(second_process.returncode, 0)
+                self.assertIn("mutation lock", second_stderr)
+                self.assertEqual(self.secrets.read_bytes(), before)
+                self.assertEqual(
+                    docker_log.read_text().splitlines() if docker_log.exists() else [], []
+                )
+                for line in self.secrets.read_text().splitlines():
+                    self.assertNotIn(line.split("=", 1)[1], second_stdout + second_stderr)
+            self.assertEqual(
+                set(line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()),
+                {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"},
+            )
+        finally:
+            release.touch()
+            stdout, stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        log_text = docker_log.read_text()
+        self.assertEqual(len(log_text.splitlines()), 2)
+        for line in self.secrets.read_text().splitlines():
+            value = line.split("=", 1)[1]
+            self.assertNotIn(value, stdout + stderr + log_text)
+
+    def test_first_activation_race_keeps_install_plan_doctor_and_run_out_of_store(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        fresh_central = self.root / "first-activation-central"
+        fresh_central.mkdir(mode=0o700)
+        fresh_global = fresh_central / "dev-core.conf"
+        shutil.copyfile(self.global_conf, fresh_global)
+        fresh_global.chmod(0o600)
+        fresh_secrets = fresh_central / "project-db.env"
+        entered = self.root / "defaults-entered"
+        release = self.root / "defaults-release"
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+        chmod = self.mock_bin / "chmod"
+        chmod.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{2-}}\" = {str(fresh_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+            f"  : > {str(entered)!r}\n"
+            f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+            "fi\n"
+            f"exec {real_chmod} \"$@\"\n"
+        )
+        chmod.chmod(0o700)
+        mock_env, _docker_log = self._mock_env()
+        mock_env.update(
+            {
+                "DEVCORE_CONFIG_DIR": str(fresh_central),
+                "DEVCORE_GLOBAL_CONF": str(fresh_global),
+                "DEVCORE_SECRETS_FILE": str(fresh_secrets),
+            }
+        )
+
+        activation = self.start_tool("activate", env=mock_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first activation did not pause after locking the store")
+            self.assertFalse(fresh_secrets.exists())
+            initial_names = {path.name for path in fresh_central.iterdir()}
+            self.assertEqual(initial_names, {"dev-core.conf"})
+            conf_before = fresh_global.read_bytes()
+
+            install = self.run_tool("install", env=mock_env)
+            self.assertNotEqual(install.returncode, 0)
+            self.assertIn("mutation lock", install.stderr)
+            for command, args in (
+                ("plan", ()),
+                ("doctor", ()),
+                ("run", ("dev", "--", "true")),
+            ):
+                result = self.run_tool(command, *args, env=mock_env)
+                self.assertEqual(fresh_global.read_bytes(), conf_before, command)
+                self.assertFalse(fresh_secrets.exists(), command)
+                self.assertEqual(
+                    {path.name for path in fresh_central.iterdir()},
+                    initial_names,
+                    command,
+                )
+                self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+        finally:
+            release.touch()
+            stdout, stderr = activation.communicate(timeout=10)
+        self.assertEqual(activation.returncode, 0, stdout + stderr)
+        keys = {line.split("=", 1)[0] for line in fresh_secrets.read_text().splitlines()}
+        self.assertEqual(keys, {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"})
+        for line in fresh_secrets.read_text().splitlines():
+            self.assertNotIn(line.split("=", 1)[1], stdout + stderr)
+
+    def test_arbitrary_state_file_overrides_are_accepted_and_share_locks(self):
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+
+        for shared_name in ("DEVCORE_SECRETS_FILE", "DEVCORE_GLOBAL_CONF"):
+            with self.subTest(shared_path=shared_name):
+                first_central = self.root / f"central-one-{shared_name}"
+                second_central = self.root / f"central-two-{shared_name}"
+                shared_state = self.root / f"external-{shared_name}"
+                shared_state.parent.mkdir(parents=True, exist_ok=True)
+                if shared_name == "DEVCORE_SECRETS_FILE":
+                    first_secrets = second_secrets = shared_state
+                    first_global = first_central / "external-global.conf"
+                    second_global = second_central / "external-global.conf"
+                else:
+                    first_global = second_global = shared_state
+                    first_secrets = first_central / "external-secrets.env"
+                    second_secrets = second_central / "external-secrets.env"
+
+                entered = self.root / f"entered-{shared_name}"
+                release = self.root / f"release-{shared_name}"
+                mock_bin = self.root / f"mock-bin-{shared_name}"
+                mock_bin.mkdir()
+                chmod = mock_bin / "chmod"
+                chmod.write_text(
+                    "#!/bin/sh\n"
+                    f"if [ \"${{2-}}\" = {str(first_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+                    f"  : > {str(entered)!r}\n"
+                    f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+                    "fi\n"
+                    f"exec {real_chmod} \"$@\"\n"
+                )
+                chmod.chmod(0o700)
+
+                first_env = self.env()
+                first_env.update(
+                    {
+                        "PATH": str(mock_bin) + os.pathsep + os.environ["PATH"],
+                        "DEVCORE_CONFIG_DIR": str(first_central),
+                        "DEVCORE_GLOBAL_CONF": str(first_global),
+                        "DEVCORE_SECRETS_FILE": str(first_secrets),
+                    }
+                )
+                second_env = self.env()
+                second_env.update(
+                    {
+                        "DEVCORE_CONFIG_DIR": str(second_central),
+                        "DEVCORE_GLOBAL_CONF": str(second_global),
+                        "DEVCORE_SECRETS_FILE": str(second_secrets),
+                    }
+                )
+
+                first = self.start_tool("install", env=first_env)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not entered.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(entered.exists(), "first install did not hold its state locks")
+                    self.assertFalse(shared_state.exists())
+
+                    second = self.run_tool("install", env=second_env)
+                    self.assertNotEqual(second.returncode, 0)
+                    self.assertIn("mutation lock", second.stderr)
+                    self.assertFalse(second_central.exists())
+                    self.assertFalse(shared_state.exists())
+                finally:
+                    release.touch()
+                    first_stdout, first_stderr = first.communicate(timeout=10)
+
+                self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+                self.assertTrue(shared_state.exists())
+                self.assertEqual(shared_state.stat().st_mode & 0o777, 0o600)
+                self.assertTrue(first_central.exists())
+                self.assertFalse(second_central.exists())
+
+                first_secrets.write_text(
+                    f"DEMO_DEV_DB_PASSWORD={DEV_PASSWORD}\n"
+                    f"DEMO_TEST_DB_PASSWORD={TEST_PASSWORD}\n"
+                )
+                first_secrets.chmod(0o600)
+                rendered = self.run_tool("render", env=first_env)
+                self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                self.assertIn("DEV_DATABASE_HOST=127.0.0.1", (self.project / ".env.dev").read_text())
+                self.assertIn("TEST_DATABASE_HOST=127.0.0.1", (self.project / ".env.test").read_text())
+                self.assertNotIn(DEV_PASSWORD, rendered.stdout + rendered.stderr)
+                self.assertNotIn(TEST_PASSWORD, rendered.stdout + rendered.stderr)
+
+    def test_equivalent_state_paths_use_the_same_mutation_lock(self):
+        shared_dir = self.root / "normalized-shared"
+        shared_dir.mkdir()
+        shared_secret = shared_dir / "secrets.env"
+        alias_dir = self.root / "normalized-alias"
+        alias_dir.symlink_to(shared_dir, target_is_directory=True)
+        alias_secret = alias_dir / "nested" / ".." / "secrets.env"
+        first_central = self.root / "normalized-central-one"
+        second_central = self.root / "normalized-central-two"
+        lock_one = self.mutation_lock_path(shared_secret)
+        lock_two = self.mutation_lock_path(alias_secret)
+        self.assertEqual(lock_one, lock_two)
+
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+        entered = self.root / "normalized-entered"
+        release = self.root / "normalized-release"
+        mock_bin = self.root / "normalized-mock-bin"
+        mock_bin.mkdir()
+        chmod = mock_bin / "chmod"
+        chmod.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{2-}}\" = {str(first_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+            f"  : > {str(entered)!r}\n"
+            f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+            "fi\n"
+            f"exec {real_chmod} \"$@\"\n"
+        )
+        chmod.chmod(0o700)
+
+        first_env = self.env()
+        first_env.update(
+            {
+                "PATH": str(mock_bin) + os.pathsep + os.environ["PATH"],
+                "DEVCORE_CONFIG_DIR": str(first_central),
+                "DEVCORE_GLOBAL_CONF": str(first_central / "global.conf"),
+                "DEVCORE_SECRETS_FILE": str(shared_secret),
+            }
+        )
+        second_env = self.env()
+        second_env.update(
+            {
+                "DEVCORE_CONFIG_DIR": str(second_central),
+                "DEVCORE_GLOBAL_CONF": str(second_central / "global.conf"),
+                "DEVCORE_SECRETS_FILE": str(alias_secret),
+            }
+        )
+
+        first = self.start_tool("install", env=first_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first install did not hold its state locks")
+            second = self.run_tool("install", env=second_env)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            self.assertFalse(shared_secret.exists())
+            self.assertFalse(second_central.exists())
+        finally:
+            release.touch()
+            first_stdout, first_stderr = first.communicate(timeout=10)
+
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+        self.assertTrue(shared_secret.exists())
+        self.assertEqual(shared_secret.stat().st_mode & 0o777, 0o600)
+
+    def test_mutation_lock_is_released_when_owner_process_dies(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        mock_env, _docker_log = self._mock_env()
+        entered = self.root / "docker-entered"
+        release = self.root / "docker-release"
+        docker = self.mock_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args=sys.argv[1:]\n"
+            "if args and args[0]=='inspect': print('true')\n"
+            "elif args and args[0]=='exec':\n"
+            "    if '-qAt' in args:\n"
+            "        index=args.index('-v'); db=args[index+1].removeprefix('db=')\n"
+            "        print({'demo_dev':'demo_dev','demo_test':'demo_test'}.get(db, 'unknown'))\n"
+            "    elif not os.path.exists(" + repr(str(entered)) + "):\n"
+            f"        open({str(entered)!r}, 'w').close()\n"
+            f"        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n"
+            "else: raise SystemExit(2)\n"
+        )
+        docker.chmod(0o700)
+        owner = self.start_tool("activate", env=mock_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "lock owner did not reach provisioning")
+            os.killpg(owner.pid, signal.SIGKILL)
+            owner.communicate(timeout=5)
+            release.touch()
+            retry = self.run_tool("activate", env=mock_env)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+        finally:
+            release.touch()
+            if owner.poll() is None:
+                os.killpg(owner.pid, signal.SIGKILL)
+                owner.communicate(timeout=5)
+
+    def test_concurrent_projects_do_not_lose_shared_secret_store_updates(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        self.secrets.write_text("")
+        self.secrets.chmod(0o600)
+        other = self.root / "other-project"
+        other.mkdir()
+        shutil.copytree(self.project / ".devcore", other / ".devcore")
+        (other / ".gitignore").write_text((self.project / ".gitignore").read_text())
+        other_conf = other / ".devcore" / "project.conf"
+        config = other_conf.read_text()
+        config = config.replace("PROJECT_KEY=demo", "PROJECT_KEY=other")
+        config = config.replace("DEV_DB_ROLE=demo_dev", "DEV_DB_ROLE=other_dev")
+        config = config.replace("DEV_DB_NAME=demo_dev", "DEV_DB_NAME=other_dev")
+        config = config.replace("TEST_DB_ROLE=demo_test", "TEST_DB_ROLE=other_test")
+        config = config.replace("TEST_DB_NAME=demo_test", "TEST_DB_NAME=other_test")
+        config = config.replace("DEV_SECRET_KEY=DEMO_DEV_DB_PASSWORD", "DEV_SECRET_KEY=OTHER_DEV_DB_PASSWORD")
+        config = config.replace("TEST_SECRET_KEY=DEMO_TEST_DB_PASSWORD", "TEST_SECRET_KEY=OTHER_TEST_DB_PASSWORD")
+        config = config.replace("REDIS_PREFIX=demo", "REDIS_PREFIX=other")
+        other_conf.write_text(config)
+        subprocess.run(
+            ["git", "-c", "init.defaultBranch=main", "init", "-q"],
+            cwd=other,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        entered = self.root / "shared-docker-entered"
+        release = self.root / "shared-docker-release"
+        docker_log = self.root / "shared-docker.log"
+        docker = self.mock_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "args=sys.argv[1:]\n"
+            "if args and args[0]=='inspect': print('true')\n"
+            "elif args and args[0]=='exec':\n"
+            "    if '-qAt' in args:\n"
+            "        index=args.index('-v'); db=args[index+1].removeprefix('db='); print(db)\n"
+            "    else:\n"
+            f"        open({str(entered)!r}, 'w').close()\n"
+            f"        while not os.path.exists({str(release)!r}): time.sleep(0.01)\n"
+            f"        open({str(docker_log)!r}, 'a').write('provision\\n')\n"
+            "else: raise SystemExit(2)\n"
+        )
+        docker.chmod(0o700)
+        first_env = self.env()
+        first_env.update({"PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"]})
+        first = subprocess.Popen(
+            [str(TOOL), "activate"], cwd=self.project, env=first_env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first project did not reach provisioning")
+            other_env = self.env()
+            other_env.update(
+                {
+                    "PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"],
+                    "DEVCORE_MUTATION_LOCK_HELD": "1",
+                "DEVCORE_TEST_DEV_ROLE": "other_dev",
+                "DEVCORE_TEST_TEST_ROLE": "other_test",
+                }
+            )
+            second = subprocess.run(
+                [str(TOOL), "activate"], cwd=other, env=other_env,
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            keys = {line.split("=", 1)[0] for line in self.secrets.read_text().splitlines()}
+            self.assertEqual(keys, {"DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD"})
+            self.assertFalse(docker_log.exists(), "contending project reached role provisioning")
+            self.assertNotIn(DEV_PASSWORD, second.stdout + second.stderr)
+            self.assertNotIn(TEST_PASSWORD, second.stdout + second.stderr)
+            before_retry = self.secrets.read_bytes()
+            first_values = [line.split("=", 1)[1] for line in before_retry.decode().splitlines()]
+        finally:
+            release.touch()
+            if first.poll() is None:
+                try:
+                    stdout, stderr = first.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(first.pid, signal.SIGKILL)
+                    stdout, stderr = first.communicate(timeout=5)
+            else:
+                stdout, stderr = first.communicate(timeout=5)
+        self.assertEqual(first.returncode, 0, stdout + stderr)
+        self.assertEqual(self.secrets.read_bytes(), before_retry)
+        first_log = docker_log.read_text()
+        self.assertEqual(len(first_log.splitlines()), 2)
+        for value in first_values:
+            self.assertNotIn(value, stdout + stderr + second.stdout + second.stderr + first_log)
+        retry = subprocess.run(
+            [str(TOOL), "activate"], cwd=other, env=other_env,
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        secret_lines = self.secrets.read_text().splitlines()
+        keys = {line.split("=", 1)[0] for line in secret_lines}
+        self.assertEqual(
+            keys,
+            {
+                "DEMO_DEV_DB_PASSWORD", "DEMO_TEST_DB_PASSWORD",
+                "OTHER_DEV_DB_PASSWORD", "OTHER_TEST_DB_PASSWORD",
+            },
+        )
+        log_text = docker_log.read_text()
+        self.assertEqual(len(log_text.splitlines()), 4)
+        for line in secret_lines:
+            value = line.split("=", 1)[1]
+            self.assertNotIn(value, stdout + stderr + retry.stdout + retry.stderr + log_text)
+
+    def test_mutation_lock_rejects_symlink_and_unsafe_mode(self):
+        lock = self.mutation_lock_path(self.secrets)
+        lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = self.root / "outside-lock"
+        target.write_text("unchanged\n")
+        lock.symlink_to(target)
+        symlink_result = self.run_tool("render")
+        self.assertNotEqual(symlink_result.returncode, 0)
+        self.assertIn("lock", symlink_result.stderr.lower())
+        self.assertEqual(target.read_text(), "unchanged\n")
+        lock.unlink()
+        lock.touch(mode=0o644)
+        lock.chmod(0o644)
+        mode_result = self.run_tool("render")
+        self.assertNotEqual(mode_result.returncode, 0)
+        self.assertIn("lock", mode_result.stderr.lower())
+        lock.chmod(0o600)
+        self.central.chmod(0o755)
+        parent_result = self.run_tool("render")
+        self.assertNotEqual(parent_result.returncode, 0)
+        self.assertIn("central config directory", parent_result.stderr)
+
     def test_repository_owned_version_is_reported(self):
         result = self.run_tool("version")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -405,6 +908,152 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
         self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
 
+    def _rendered_doctor_fixture(self):
+        self._start_database_endpoints()
+        self._install_database_mocks()
+        env, log = self._mock_env()
+        rendered = self.run_tool("render", env=env)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        log.write_text("")
+        return env, log
+
+    def test_doctor_rejects_postgresql_role_and_ownership_drift(self):
+        env, log = self._rendered_doctor_fixture()
+        cases = []
+        for profile in ("DEV", "TEST"):
+            for key, value in (
+                ("CURRENT_USER", "wrong_role"),
+                ("CURRENT_DATABASE", "wrong_database"),
+                ("SERVER_VERSION", "not-a-number"),
+            ):
+                cases.append((profile, key, value))
+            for key, value in (
+                ("LOGIN", "f"),
+                ("SUPERUSER", "t"),
+                ("CREATEROLE", "t"),
+                ("REPLICATION", "t"),
+                ("BYPASSRLS", "t"),
+                ("OWNER", "wrong_owner"),
+                ("MEMBERSHIP_COUNT", "1"),
+            ):
+                cases.append((profile, key, value))
+        cases.extend((("DEV", "CREATEDB", "t"), ("TEST", "CREATEDB", "f")))
+
+        for profile, key, value in cases:
+            with self.subTest(profile=profile, invariant=key, value=value):
+                case_env = dict(env)
+                case_env[f"DEVCORE_TEST_DOCTOR_{profile}_{key}"] = value
+                result = self.run_tool("doctor", env=case_env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invariant", result.stderr.lower())
+                self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn("provision", log.read_text())
+
+    def test_doctor_accepts_test_createdb_no_when_contract_requires_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        project_conf = self.project / ".devcore" / "project.conf"
+        project_conf.write_text(
+            project_conf.read_text().replace("TEST_ROLE_CREATEDB=yes", "TEST_ROLE_CREATEDB=no")
+        )
+        env["DEVCORE_TEST_DOCTOR_TEST_CREATEDB"] = "f"
+        rendered = self.run_tool("render", env=env)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+
+        result = self.run_tool("doctor", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DEV PostgreSQL authentication: demo_dev / demo_dev", result.stdout)
+        self.assertIn("TEST PostgreSQL authentication: demo_test / demo_test", result.stdout)
+        self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+        self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
+    def test_doctor_rejects_stale_rendered_environment_without_modifying_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        target = self.project / ".env.dev"
+        cases = (
+            ("host", lambda text: re.sub(rb"(?m)^DEV_DATABASE_HOST=.*$", b"DEV_DATABASE_HOST=192.0.2.8", text, count=1)),
+            ("port", lambda text: re.sub(rb"(?m)^DEV_DATABASE_PORT=\d+$", b"DEV_DATABASE_PORT=1", text, count=1)),
+            ("username", lambda text: re.sub(rb"(?m)^DEV_DATABASE_USERNAME=.*$", b"DEV_DATABASE_USERNAME=stale_user", text, count=1)),
+            ("database", lambda text: re.sub(rb"(?m)^DEV_DATABASE_NAME=.*$", b"DEV_DATABASE_NAME=stale_database", text, count=1)),
+            ("password", lambda text: text.replace(
+                f"DEV_DATABASE_PASSWORD={DEV_PASSWORD}".encode(),
+                b"DEV_DATABASE_PASSWORD=STALE_RENDERED_PASSWORD",
+                1,
+            )),
+            ("required managed key", lambda text: re.sub(
+                rb"(?m)^DEV_DATABASE_USERNAME=.*\n", b"", text, count=1
+            )),
+        )
+
+        for label, mutate in cases:
+            with self.subTest(field=label):
+                rendered = self.run_tool("render", env=env)
+                self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                correct = target.read_bytes()
+                mutated = mutate(correct)
+                self.assertNotEqual(
+                    hashlib.sha256(mutated).digest(),
+                    hashlib.sha256(correct).digest(),
+                )
+                target.write_bytes(mutated)
+                before_hash = hashlib.sha256(target.read_bytes()).digest()
+
+                result = self.run_tool("doctor", env=env)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(".env.dev", result.stderr)
+                self.assertIn("stale", result.stderr.lower())
+                self.assertEqual(
+                    hashlib.sha256(target.read_bytes()).digest(),
+                    before_hash,
+                    "doctor modified the rendered target",
+                )
+                self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+                self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
+    def test_doctor_allows_unmanaged_rendered_content_without_mutating_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        target = self.project / ".env.dev"
+        target.write_bytes(
+            b"# local unmanaged comment\nLOCAL_ONLY_SETTING=preserved\n"
+            + target.read_bytes()
+        )
+        rendered = self.run_tool("render", env=env)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        rendered_bytes = target.read_bytes()
+        self.assertIn(b"# local unmanaged comment\n", rendered_bytes)
+        self.assertIn(b"LOCAL_ONLY_SETTING=preserved\n", rendered_bytes)
+
+        result = self.run_tool("doctor", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), hashlib.sha256(rendered_bytes).digest())
+        self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+        self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
+    def test_doctor_rejects_stale_test_rendered_password_without_modifying_it(self):
+        env, _log = self._rendered_doctor_fixture()
+        target = self.project / ".env.test"
+        correct = target.read_bytes()
+        mutated = correct.replace(
+            f"TEST_DATABASE_PASSWORD={TEST_PASSWORD}".encode(),
+            b"TEST_DATABASE_PASSWORD=STALE_RENDERED_PASSWORD",
+            1,
+        )
+        self.assertNotEqual(hashlib.sha256(mutated).digest(), hashlib.sha256(correct).digest())
+        target.write_bytes(mutated)
+        before_hash = hashlib.sha256(target.read_bytes()).digest()
+
+        result = self.run_tool("doctor", env=env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env.test", result.stderr)
+        self.assertIn("stale", result.stderr.lower())
+        self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), before_hash)
+        self.assertNotIn(DEV_PASSWORD, result.stdout + result.stderr)
+        self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
+
     def test_missing_secret_fails_without_printing_other_values(self):
         self.secrets.write_text("DEMO_DEV_DB_PASSWORD=" + DEV_PASSWORD + "\n")
         self.secrets.chmod(0o600)
@@ -484,7 +1133,8 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             "'demo_test':os.environ['DEVCORE_TEST_EXPECTED_TEST_PASSWORD']}\n"
             "    if password != expected[role]:\n"
             "        raise SystemExit('synthetic authentication rejected')\n"
-            "    print(f'{role}|{db}|180006')\n"
+            "    createdb='f' if role == 'demo_dev' else 't'\n"
+            "    print(f'{role}|{db}|180006|{role}|t|f|{createdb}|f|f|f|0')\n"
             "else:\n"
             "    raise SystemExit(2)\n"
         )
@@ -552,11 +1202,66 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         self.assertNotIn(TEST_PASSWORD, result.stdout + result.stderr)
 
     def test_install_creates_private_local_secret_files(self):
+        secrets_before = self.secrets.read_bytes()
+        config_before = self.global_conf.read_bytes()
         result = self.run_tool("install")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.secrets.read_bytes(), secrets_before)
+        self.assertEqual(self.global_conf.read_bytes(), config_before)
         self.assertEqual(self.central.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.secrets.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.global_conf.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_first_install_serializes_empty_store_creation(self):
+        fresh_central = self.root / "concurrent-install-central"
+        fresh_global = fresh_central / "dev-core.conf"
+        fresh_secrets = fresh_central / "project-db.env"
+        entered = self.root / "install-entered"
+        release = self.root / "install-release"
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+        chmod = self.mock_bin / "chmod"
+        chmod.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{2-}}\" = {str(fresh_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+            f"  : > {str(entered)!r}\n"
+            f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+            "fi\n"
+            f"exec {real_chmod} \"$@\"\n"
+        )
+        chmod.chmod(0o700)
+        env = self.env()
+        env.update(
+            {
+                "PATH": str(self.mock_bin) + os.pathsep + os.environ["PATH"],
+                "DEVCORE_CONFIG_DIR": str(fresh_central),
+                "DEVCORE_GLOBAL_CONF": str(fresh_global),
+                "DEVCORE_SECRETS_FILE": str(fresh_secrets),
+            }
+        )
+
+        first = self.start_tool("install", env=env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first install did not hold the lock during initialization")
+            self.assertFalse(fresh_global.exists())
+            self.assertFalse(fresh_secrets.exists())
+            self.assertEqual({path.name for path in fresh_central.iterdir()}, set())
+            second = self.run_tool("install", env=env)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            self.assertFalse(fresh_global.exists())
+            self.assertFalse(fresh_secrets.exists())
+        finally:
+            release.touch()
+            first_stdout, first_stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+        self.assertEqual(fresh_secrets.read_bytes(), b"")
+        self.assertIn(b"PG_ADMIN_ROLE=devcore_admin", fresh_global.read_bytes())
+        self.assertEqual(fresh_secrets.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(fresh_global.stat().st_mode & 0o777, 0o600)
 
     def test_documented_v1_consumer_contract_still_renders(self):
         config = self.project / ".devcore"

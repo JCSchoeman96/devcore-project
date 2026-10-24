@@ -1,6 +1,6 @@
 # Architecture
 
-Status: current canonical implementation baseline for DevCore 1.1.0 (proposed). Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
+Status: current canonical implementation baseline for DevCore `v1.1.0`, released on 2026-10-23 from source commit `60f2ef09e52abca7b20f1572795579a549ba9d61`. Repository owner: `JCSchoeman96`, who created and owns all DevCore materials. Source history begins with the TICK-45 canonicalization branch. The recovered v1.0.0 artifacts have no recovered historical Git source history and are not represented as canonical Git source. See [provenance](provenance.md).
 
 ## Ownership
 
@@ -12,14 +12,18 @@ The workstation-local secret file under `~/.config/dev-core/` is the source for 
 
 ## Command flow
 
-- `plan` parses the project and workstation allocation, reports non-secret endpoints, role names, output paths, and whether each configured owner and supplemental secret exists, then fails closed when any declared supplemental secret is missing.
+- `plan` parses the project and workstation allocation, reports non-secret endpoints, role names, output paths, and whether each configured owner and supplemental secret exists, then fails closed when any declared supplemental secret is missing. It is read-only and does not initialize central files.
 - `activate` initializes missing workstation config, creates missing DEV/TEST owner secrets, provisions the configured PostgreSQL roles and databases, renders ignored environment files, and checks configured services.
-- `doctor` validates available credentials and checks configured endpoints. PostgreSQL checks authenticate without changing database state. Redis checks use a short-lived, project-prefixed probe key and remove it.
+- `doctor` validates available credentials and checks configured endpoints. PostgreSQL checks authenticate without changing database state. Redis checks use a short-lived, project-prefixed probe key and remove it. It does not initialize central files.
 - `render` regenerates ignored environment files from the current templates and owner secrets.
-- `run PROFILE -- COMMAND` removes declared supplemental variables from the parent environment, adds the rendered files for `PROFILE` and `all`, applies declared supplemental secrets from the workstation store, then replaces itself with the requested command.
+- `run PROFILE -- COMMAND` removes declared supplemental variables from the parent environment, adds the rendered files for `PROFILE` and `all`, applies declared supplemental secrets from the workstation store, then replaces itself with the requested command. It does not initialize central files.
 - `rotate` rotates both owner credentials, synchronizes the configured database roles, re-renders local files, and checks connectivity.
 
+`install`, `activate`, `rotate`, and `render` acquire nonblocking locks for the normalized `DEVCORE_SECRETS_FILE` and `DEVCORE_GLOBAL_CONF` paths. Lock files live in the fixed account-owned `~/.config/dev-core/locks` directory, use SHA-256 path identities, and are acquired in sorted order. This serializes initialization and secret-store updates even when callers use different `DEVCORE_CONFIG_DIR` values for shared state files. It also keeps `render` from reading DEV and TEST values across two separate replacements during rotation. Existing v1 state-file overrides remain supported. Missing state files are created atomically without replacing a file created concurrently. Lock descriptors remain open through command execution, and the operating system releases the locks when the process exits.
+
 The tool calls `docker exec` for existing PostgreSQL/Redis containers when required. It does not manage container lifecycle. Shared service ownership remains with the workstation infrastructure owner.
+
+The current workstation service names, endpoints, PostgreSQL version, persistence, and authentication settings are recorded in the [workstation stack contract](workstation-stack-contract.md). That contract also records observed differences between the Compose source and active containers. DevCore does not reconcile those differences by changing shared services.
 
 ## Baseline limits
 

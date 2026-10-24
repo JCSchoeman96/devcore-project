@@ -10,7 +10,15 @@ The renderer writes secret-bearing local environment files with mode `0600`. A c
 
 The CLI disables shell xtrace and rejects secret-handling commands if xtrace is enabled. `plan`, `doctor`, and ordinary errors report secret-key names or presence, not values. Tests use synthetic values and assert that captured command output does not contain them.
 
+`install`, `activate`, `rotate`, and `render` take nonblocking exclusive locks before changing workstation state or reading secrets for output. The lock files live in the fixed account-owned `~/.config/dev-core/locks` directory and are named from SHA-256 hashes of the normalized secret-store and global-configuration paths. Commands acquire both locks in sorted filename order and keep both descriptors open through execution. The lock directory must be owned by the current user with mode `0700`; each lock must be a regular, non-symlink file owned by the current user with mode `0600`, have one link, and match its open descriptor's device and inode. A command exits before provisioning or rendering if another mutation holds either lock or if validation fails. The operating system releases the locks when the process exits.
+
+`DEVCORE_SECRETS_FILE` and `DEVCORE_GLOBAL_CONF` remain arbitrary file-path overrides. Their normalized paths determine the lock identities, so processes with different `DEVCORE_CONFIG_DIR` values still contend when they point at the same state file. Final-component symlinks are rejected, while symlinked parent paths resolve to the same lock identity. Existing central state files must be regular files owned by the current user with mode `0600`; symlinks and files with additional hard links fail closed. Initialization creates each missing file atomically without replacing a file that appears concurrently.
+
+`plan`, `doctor`, and `run` do not initialize or repair central state. They read existing files, use documented endpoint defaults where possible, and report missing required credentials or rendered files. Use `install` or `activate` to initialize workstation state.
+
 When workstation `psql` is unavailable, `doctor` sends the password to the existing container over `docker exec -i` standard input. The container shell exports it for `psql`; the local Docker client's argument vector and temporary files do not contain the password.
+
+The PostgreSQL portion of `doctor` uses an authenticated, read-only query to check role identity, database ownership, privilege flags, and role memberships. DEV must remain NOCREATEDB; TEST `CREATEDB` must match the consumer contract. Neither owner role may have role memberships. Drift is reported without revoking memberships or changing PostgreSQL state.
 
 ## Database and service boundaries
 

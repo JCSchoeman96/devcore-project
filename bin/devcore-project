@@ -7,8 +7,13 @@ VERSION="1.1.0"
 PROGRAM="devcore-project"
 
 CENTRAL_DIR="${DEVCORE_CONFIG_DIR:-$HOME/.config/dev-core}"
-CENTRAL_SECRETS="${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}"
-GLOBAL_CONF="${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}"
+if [[ -n "${DEVCORE_MUTATION_LOCK_FDS:-}" ]]; then
+  CENTRAL_SECRETS="${DEVCORE_MUTATION_SECRETS_PATH:-${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}}"
+  GLOBAL_CONF="${DEVCORE_MUTATION_GLOBAL_CONF_PATH:-${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}}"
+else
+  CENTRAL_SECRETS="${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}"
+  GLOBAL_CONF="${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}"
+fi
 PROJECT_CONF="${DEVCORE_PROJECT_CONF:-.devcore/project.conf}"
 
 log()  { printf '%s\n' "$*" >&2; }
@@ -146,12 +151,82 @@ normalize_secret_key() {
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | sed -E 's/[-.]/_/g; s/[^A-Z0-9_]/_/g; s/^([0-9])/_\1/'
 }
 
+validate_state_paths() {
+  python3 -c '
+import os, stat, sys
+from pathlib import Path
+
+def normalized_state_path(raw):
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.name or path.name in (".", ".."):
+        raise RuntimeError("central state file path must name a file")
+    canonical = path.parent.resolve(strict=False) / path.name
+    try:
+        entry = canonical.lstat()
+    except FileNotFoundError:
+        entry = None
+    if entry is not None and stat.S_ISLNK(entry.st_mode):
+        raise RuntimeError(f"central state file must not be a symlink: {canonical}")
+    return canonical
+
+central = Path(sys.argv[1]).expanduser()
+canonical_dir = Path(os.path.abspath(os.path.normpath(central)))
+try:
+    secrets = normalized_state_path(sys.argv[2])
+    global_conf = normalized_state_path(sys.argv[3])
+except (OSError, RuntimeError) as error:
+    raise SystemExit(f"ERROR: {error}")
+if secrets == global_conf:
+    raise SystemExit("ERROR: DEVCORE_SECRETS_FILE and DEVCORE_GLOBAL_CONF must identify different files")
+
+try:
+    directory = canonical_dir.lstat()
+except FileNotFoundError:
+    directory = None
+if directory is not None:
+    if stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode):
+        raise SystemExit("ERROR: central config path must be a real directory")
+    if directory.st_uid != os.getuid() or stat.S_IMODE(directory.st_mode) != 0o700:
+        raise SystemExit("ERROR: central config directory must be owned by this user with mode 0700")
+
+for path in (secrets, global_conf):
+    try:
+        entry = path.lstat()
+    except FileNotFoundError:
+        continue
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        raise SystemExit(f"ERROR: central state file must be a regular non-symlink file: {path}")
+    if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o600:
+        raise SystemExit(f"ERROR: central state file must be owned by this user with mode 0600: {path}")
+    if entry.st_nlink != 1:
+        raise SystemExit(f"ERROR: central state file must not have additional hard links: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise SystemExit(f"ERROR: cannot safely open central state file {path}: {error}")
+    try:
+        opened = os.fstat(fd)
+        current = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit(f"ERROR: central state file changed during validation: {path}")
+    finally:
+        os.close(fd)
+' "$CENTRAL_DIR" "$CENTRAL_SECRETS" "$GLOBAL_CONF"
+}
+
 write_global_defaults() {
   mkdir -p "$CENTRAL_DIR"
   chmod 700 "$CENTRAL_DIR"
-  if [[ ! -e "$GLOBAL_CONF" ]]; then
-    cat > "$GLOBAL_CONF" <<'EOF_GLOBAL'
-# dev-core workstation endpoints. Non-secret.
+  python3 -c '
+import os, stat, sys, tempfile
+from pathlib import Path
+
+global_conf = Path(sys.argv[1]).expanduser()
+secrets = Path(sys.argv[2]).expanduser()
+global_body = b"""# dev-core workstation endpoints. Non-secret.
 PG_DEV_HOST=127.0.0.1
 PG_DEV_PORT=55432
 PG_TEST_HOST=127.0.0.1
@@ -165,13 +240,49 @@ PG_TEST_CONTAINER=dev-core-postgres-test-1
 REDIS_DEV_CONTAINER=dev-core-redis-dev-1
 REDIS_TEST_CONTAINER=dev-core-redis-test-1
 PG_ADMIN_ROLE=devcore_admin
-EOF_GLOBAL
-    chmod 600 "$GLOBAL_CONF"
-  fi
-  if [[ ! -e "$CENTRAL_SECRETS" ]]; then
-    : > "$CENTRAL_SECRETS"
-    chmod 600 "$CENTRAL_SECRETS"
-  fi
+"""
+
+def validate(path):
+    try:
+        entry = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        raise RuntimeError(f"central state file must be a regular non-symlink file: {path}")
+    if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o600:
+        raise RuntimeError(f"central state file must be owned by this user with mode 0600: {path}")
+    if entry.st_nlink != 1:
+        raise RuntimeError(f"central state file must not have additional hard links: {path}")
+    return True
+
+def create_if_absent(path, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if validate(path):
+        return
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if not validate(path):
+                raise RuntimeError(f"central state file disappeared during initialization: {path}")
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+create_if_absent(global_conf, global_body)
+create_if_absent(secrets, b"")
+' "$GLOBAL_CONF" "$CENTRAL_SECRETS"
 }
 
 load_global() {
@@ -454,11 +565,6 @@ container_running() {
 }
 
 ensure_secret_pair() {
-  mkdir -p "$CENTRAL_DIR"
-  chmod 700 "$CENTRAL_DIR"
-  [[ -e "$CENTRAL_SECRETS" ]] || { : > "$CENTRAL_SECRETS"; chmod 600 "$CENTRAL_SECRETS"; }
-  chmod 600 "$CENTRAL_SECRETS"
-
   local dev test
   dev="$(kv_get "$CENTRAL_SECRETS" "$DEV_SECRET_KEY")"
   test="$(kv_get "$CENTRAL_SECRETS" "$TEST_SECRET_KEY")"
@@ -540,16 +646,16 @@ provision_all() {
   pass "TEST PostgreSQL role/database ready: $TEST_DB_ROLE / $TEST_DB_NAME"
 }
 
-render_one() {
-  local profile="$1" template="$2" target="$3" purge="$4"
-  ensure_ignored "$target"
+render_target() {
+  local action="$1" profile="$2" template="$3" target="$4" purge="$5"
   python3 -c '
 from pathlib import Path
 import os,re,sys,tempfile
-project_conf=Path(sys.argv[1]); global_conf=Path(sys.argv[2]); secret_file=Path(sys.argv[3])
-template=Path(sys.argv[4]); target=Path(sys.argv[5]); purge_arg=sys.argv[6]
-supplemental_map=sys.argv[7] if len(sys.argv)>7 else ""
-render_profile=sys.argv[8] if len(sys.argv)>8 else ""
+action=sys.argv[1]
+project_conf=Path(sys.argv[2]); global_conf=Path(sys.argv[3]); secret_file=Path(sys.argv[4])
+template=Path(sys.argv[5]); target=Path(sys.argv[6]); purge_arg=sys.argv[7]
+supplemental_map=sys.argv[8] if len(sys.argv)>8 else ""
+render_profile=sys.argv[9] if len(sys.argv)>9 else ""
 
 def parse(path):
     out={}
@@ -644,19 +750,33 @@ for raw in existing.splitlines():
     if probe and not probe.startswith("#") and "=" in probe and probe.split("=",1)[0].strip() in remove:
         continue
     kept.append(raw)
-text="\n".join(kept).rstrip()
-if text: text += "\n\n"
-text += block+"\n"
-target.parent.mkdir(parents=True,exist_ok=True)
-fd,tmp=tempfile.mkstemp(prefix=f".{target.name}.",dir=str(target.parent),text=True)
-try:
-    with os.fdopen(fd,"w") as f:
-        f.write(text); f.flush(); os.fsync(f.fileno())
-    os.chmod(tmp,0o600); os.replace(tmp,target)
-finally:
-    if os.path.exists(tmp): os.unlink(tmp)
-os.chmod(target,0o600)
-' "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge" "${SUPPLEMENTAL_SECRETS:-}" "$profile"
+expected_content="\n".join(kept).rstrip()
+if expected_content: expected_content += "\n\n"
+expected_content += block+"\n"
+if action == "check":
+    if not target.is_file():
+        raise SystemExit(f"rendered local env missing: {target}")
+    if target.read_text() != expected_content:
+        raise SystemExit(f"rendered local env stale: {target}")
+elif action == "write":
+    target.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix=f".{target.name}.",dir=str(target.parent),text=True)
+    try:
+        with os.fdopen(fd,"w") as f:
+            f.write(expected_content); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp,0o600); os.replace(tmp,target)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    os.chmod(target,0o600)
+else:
+    raise SystemExit("invalid render operation")
+' "$action" "$PROJECT_CONF" "$GLOBAL_CONF" "$CENTRAL_SECRETS" "$template" "$target" "$purge" "${SUPPLEMENTAL_SECRETS:-}" "$profile"
+}
+
+render_one() {
+  local profile="$1" template="$2" target="$3" purge="$4"
+  ensure_ignored "$target"
+  render_target write "$profile" "$template" "$target" "$purge"
   pass "rendered $target ($profile)"
 }
 
@@ -677,23 +797,51 @@ with socket.create_connection((host,port),timeout=2):
 }
 
 db_doctor() {
-  local label="$1" container="$2" role="$3" db="$4" secret_key="$5" host="$6" port="$7"
+  local label="$1" container="$2" role="$3" db="$4" secret_key="$5" host="$6" port="$7" allow_createdb="$8"
   container_running "$container" || die "$label PostgreSQL container unavailable: $container"
   tcp_check "$label PostgreSQL" "$host" "$port"
   local password result
   password="$(kv_get "$CENTRAL_SECRETS" "$secret_key")"
   validate_secret_value "$label password" "$password"
+  local query="
+SELECT current_user,
+       current_database(),
+       current_setting('server_version_num'),
+       pg_get_userbyid(d.datdba),
+       r.rolcanlogin,
+       r.rolsuper,
+       r.rolcreatedb,
+       r.rolcreaterole,
+       r.rolreplication,
+       r.rolbypassrls,
+       (SELECT count(*)
+          FROM pg_auth_members AS m
+         WHERE m.member = r.oid OR m.roleid = r.oid)
+  FROM pg_roles AS r
+  JOIN pg_database AS d ON d.datname = current_database()
+ WHERE r.rolname = current_user;"
   if command -v psql >/dev/null 2>&1; then
     result="$(PGPASSWORD="$password" psql -X -qAt -h "$host" -p "$port" -U "$role" -d "$db" \
-      -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
+      -F '|' -c "$query")"
   else
     result="$(printf '%s\n' "$password" | docker exec -i "$container" \
       sh -c 'IFS= read -r PGPASSWORD || exit 1; export PGPASSWORD; exec psql "$@"' \
       devcore-psql -X -qAt -h 127.0.0.1 -U "$role" -d "$db" \
-      -c "SELECT current_user || '|' || current_database() || '|' || current_setting('server_version_num');")"
+      -F '|' -c "$query")"
   fi
-  [[ "$result" == "$role|$db|"* ]] || die "$label PostgreSQL authentication proof failed"
-  pass "$label PostgreSQL authentication: $role / $db"
+  local -a fields
+  IFS='|' read -r -a fields <<< "$result"
+  [[ "${#fields[@]}" -eq 11 && "${fields[2]}" =~ ^[0-9]+$ ]] || \
+    die "$label PostgreSQL invariant query returned an unexpected result"
+  local expected_createdb="f"
+  [[ "$allow_createdb" == "yes" ]] && expected_createdb="t"
+  [[ "${fields[0]}" == "$role" && "${fields[1]}" == "$db" && \
+     "${fields[3]}" == "$role" && "${fields[4]}" == "t" && \
+     "${fields[5]}" == "f" && "${fields[6]}" == "$expected_createdb" && \
+     "${fields[7]}" == "f" && "${fields[8]}" == "f" && \
+     "${fields[9]}" == "f" && "${fields[10]}" == "0" ]] || \
+    die "$label PostgreSQL role, ownership, or membership invariant failed"
+  pass "$label PostgreSQL authentication: $role / $db (server version ${fields[2]})"
 }
 
 redis_doctor() {
@@ -722,16 +870,17 @@ redis_doctor() {
 }
 
 check_local_modes() {
-  local _profile="$1" _template="$2" target="$3" _purge="$4"
+  local profile="$1" template="$2" target="$3" purge="$4"
   [[ -f "$target" ]] || die "rendered local env missing: $target"
   local mode
   mode="$(stat -c '%a' "$target")"
   [[ "$mode" == "600" ]] || die "$target mode is $mode, expected 600"
+  render_target check "$profile" "$template" "$target" "$purge"
 }
 
 doctor_all() {
-  db_doctor DEV "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$DEV_SECRET_KEY" "$PG_DEV_HOST" "$PG_DEV_PORT"
-  db_doctor TEST "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$TEST_SECRET_KEY" "$PG_TEST_HOST" "$PG_TEST_PORT"
+  db_doctor DEV "$PG_DEV_CONTAINER" "$DEV_DB_ROLE" "$DEV_DB_NAME" "$DEV_SECRET_KEY" "$PG_DEV_HOST" "$PG_DEV_PORT" no
+  db_doctor TEST "$PG_TEST_CONTAINER" "$TEST_DB_ROLE" "$TEST_DB_NAME" "$TEST_SECRET_KEY" "$PG_TEST_HOST" "$PG_TEST_PORT" "$TEST_ROLE_CREATEDB"
   if [[ "$USE_REDIS" == "yes" ]]; then
     redis_doctor DEV "$REDIS_DEV_CONTAINER" "${REDIS_PREFIX}:dev" "$REDIS_DEV_HOST" "$REDIS_DEV_PORT"
     redis_doctor TEST "$REDIS_TEST_CONTAINER" "${REDIS_PREFIX}:test" "$REDIS_TEST_HOST" "$REDIS_TEST_PORT"
@@ -910,6 +1059,158 @@ os.execvpe(cmd[0],cmd,env)
 ' "$profile" "$RENDER_MAP" "${SUPPLEMENTAL_SECRETS:-}" "$CENTRAL_SECRETS" "$@"
 }
 
+mutation_lock_helper() {
+  python3 - "$@" <<'PY'
+import fcntl
+import hashlib
+import os
+import pwd
+import stat
+import sys
+from pathlib import Path
+
+action = sys.argv[1]
+uid = os.getuid()
+
+def normalized_state_path(raw):
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.name or path.name in (".", ".."):
+        raise RuntimeError("central state file path must name a file")
+    canonical = path.parent.resolve(strict=False) / path.name
+    try:
+        entry = canonical.lstat()
+    except FileNotFoundError:
+        entry = None
+    if entry is not None and stat.S_ISLNK(entry.st_mode):
+        raise RuntimeError(f"central state file must not be a symlink: {canonical}")
+    return canonical
+
+def state_paths(secret_raw, global_raw):
+    secret_path = normalized_state_path(secret_raw)
+    global_path = normalized_state_path(global_raw)
+    if secret_path == global_path:
+        raise RuntimeError("DEVCORE_SECRETS_FILE and DEVCORE_GLOBAL_CONF must identify different files")
+    return secret_path, global_path
+
+def lock_name(path):
+    digest = hashlib.sha256(os.fsencode(str(path))).hexdigest()
+    return f"state-{digest}.lock"
+
+def ensure_lock_directory():
+    home = Path(pwd.getpwuid(uid).pw_dir)
+    config = home / ".config"
+    devcore = config / "dev-core"
+    lock_dir = devcore / "locks"
+    chain = ((home, None), (config, None), (devcore, 0o700), (lock_dir, 0o700))
+    for path, required_mode in chain:
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            if path == home:
+                raise RuntimeError("account home directory is missing")
+            try:
+                path.mkdir(mode=required_mode or 0o700)
+            except FileExistsError:
+                pass
+            entry = path.lstat()
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise RuntimeError("DevCore mutation lock directory path must contain only real directories")
+        if entry.st_uid != uid:
+            raise RuntimeError("DevCore mutation lock directories must be owned by this user")
+        if required_mode is not None and stat.S_IMODE(entry.st_mode) != required_mode:
+            raise RuntimeError("DevCore mutation lock directories must have mode 0700")
+        if path in (home, config) and stat.S_IMODE(entry.st_mode) & 0o022:
+            raise RuntimeError("DevCore mutation lock parent directories must not be group- or world-writable")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(lock_dir, flags)
+    opened = os.fstat(directory_fd)
+    current = lock_dir.lstat()
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        os.close(directory_fd)
+        raise RuntimeError("DevCore mutation lock directory changed during validation")
+    return lock_dir, directory_fd
+
+def validate_lock_file(directory_fd, name, fd):
+    opened = os.fstat(fd)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        raise RuntimeError("mutation lock file disappeared during validation")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(opened.st_mode):
+        raise RuntimeError("mutation lock must be a regular file, not a symlink")
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise RuntimeError("mutation lock changed during validation")
+    if opened.st_uid != uid or stat.S_IMODE(opened.st_mode) != 0o600:
+        raise RuntimeError("mutation lock must be owned by this user with mode 0600")
+    if opened.st_nlink != 1:
+        raise RuntimeError("mutation lock must not have additional hard links")
+
+try:
+    secrets, global_conf = state_paths(sys.argv[2], sys.argv[3])
+    names = [(lock_name(secrets), secrets), (lock_name(global_conf), global_conf)]
+    names.sort(key=lambda item: item[0])
+    lock_dir, directory_fd = ensure_lock_directory()
+
+    if action == "acquire":
+        script = str(Path(sys.argv[4]).resolve(strict=True))
+        command = sys.argv[5]
+        args = sys.argv[6:]
+        descriptors = []
+        try:
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            for name, _path in names:
+                fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+                descriptors.append(fd)
+                validate_lock_file(directory_fd, name, fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise RuntimeError("another DevCore mutation holds a state lock")
+
+            os.close(directory_fd)
+            directory_fd = -1
+            for fd in descriptors:
+                os.set_inheritable(fd, True)
+            os.environ["DEVCORE_MUTATION_LOCK_FDS"] = ",".join(str(fd) for fd in descriptors)
+            os.environ["DEVCORE_MUTATION_SECRETS_PATH"] = str(secrets)
+            os.environ["DEVCORE_MUTATION_GLOBAL_CONF_PATH"] = str(global_conf)
+            os.execv(script, [script, command, *args])
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+            for fd in descriptors:
+                os.close(fd)
+    elif action == "validate":
+        descriptors = [int(value) for value in os.environ["DEVCORE_MUTATION_LOCK_FDS"].split(",")]
+        if len(descriptors) != len(names):
+            raise RuntimeError("inherited mutation lock descriptor count is invalid")
+        for (name, _path), fd in zip(names, descriptors):
+            validate_lock_file(directory_fd, name, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    else:
+        raise RuntimeError("unknown mutation lock helper action")
+except (OSError, RuntimeError, ValueError, KeyError, IndexError) as error:
+    if action == "validate":
+        raise SystemExit(f"ERROR: invalid inherited mutation lock: {error}")
+    raise SystemExit(f"ERROR: cannot acquire mutation lock: {error}")
+finally:
+    if "directory_fd" in locals() and directory_fd >= 0:
+        os.close(directory_fd)
+PY
+}
+
+acquire_mutation_lock() {
+  mutation_lock_helper acquire "$CENTRAL_SECRETS" "$GLOBAL_CONF" "$0" "$1" "${@:2}"
+  exit $?
+}
+
+validate_inherited_mutation_lock() {
+  mutation_lock_helper validate "$CENTRAL_SECRETS" "$GLOBAL_CONF"
+}
+
 cmd_init() {
   local project_key="" dev_role="" dev_db="" test_role="" test_db=""
   local redis_prefix="" dev_secret_key="" test_secret_key="" test_createdb="yes" use_redis="yes"
@@ -997,6 +1298,20 @@ main() {
   need_cmd python3
   local cmd="${1-help}"; shift || true
   case "$cmd" in
+    install|plan|activate|doctor|render|rotate|run)
+      validate_state_paths
+      ;;
+  esac
+  case "$cmd" in
+    install|activate|rotate|render)
+      if [[ -n "${DEVCORE_MUTATION_LOCK_FDS:-}" ]]; then
+        validate_inherited_mutation_lock
+      else
+        acquire_mutation_lock "$cmd" "$@"
+      fi
+      ;;
+  esac
+  case "$cmd" in
     help|-h|--help) usage ;;
     version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     install)
@@ -1007,7 +1322,9 @@ main() {
       cmd_init "$@"
       ;;
     plan|activate|doctor|render|rotate|run)
-      write_global_defaults
+      case "$cmd" in
+        activate|render|rotate) write_global_defaults ;;
+      esac
       load_global
       load_project
       validate_project

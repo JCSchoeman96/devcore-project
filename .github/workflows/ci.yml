@@ -38,3 +38,27 @@ jobs:
             "$bundled_script" | sha256sum --check
       - name: Run tests
         run: python3 -m unittest discover -s tests -v
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run disposable PostgreSQL integration
+        env:
+          DEVCORE_RUN_POSTGRES_INTEGRATION: "1"
+        run: python3 -m unittest tests.test_postgres_integration -v
+      - name: Remove integration containers
+        if: always()
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            exit 0
+          fi
+          mapfile -t containers < <(docker ps -aq --filter label=devcore.integration=true)
+          if [[ ${#containers[@]} -gt 0 ]]; then
+            docker rm --force --volumes "${containers[@]}"
+          fi

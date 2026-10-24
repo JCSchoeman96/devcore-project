@@ -73,6 +73,12 @@ The optional `~/.config/dev-core/dev-core.conf` file uses the same plain `KEY=va
 | `REDIS_TEST_CONTAINER` | `dev-core-redis-test-1` | Container used for TEST Redis checks. |
 | `PG_ADMIN_ROLE` | `devcore_admin` | PostgreSQL administration role used by activation. |
 
+## PostgreSQL doctor invariants
+
+The PostgreSQL portion of `doctor` authenticates as each configured owner role and verifies the current role, current database, server version, database owner, login status, and role privileges. The database owner must match the configured role. DEV must have `LOGIN` and must not have `CREATEDB`, `SUPERUSER`, `CREATEROLE`, `REPLICATION`, or `BYPASSRLS`. TEST must have `LOGIN`; its `CREATEDB` flag must exactly match `TEST_ROLE_CREATEDB`, and its other listed elevated flags must be off.
+
+Project owner roles must have no role memberships: they must not be members of another role, and no other role may be a member of them. `doctor` fails when it detects membership or privilege drift and does not change PostgreSQL state to repair it. This no-membership policy matches the current supported DEV/TEST allocations.
+
 ## `render-map.tsv` and templates
 
 Each non-comment row has three required tab-separated columns and one optional column:
@@ -101,7 +107,7 @@ Templates may use these exact tokens. Consumers choose application-specific outp
 
 The renderer rejects unresolved uppercase template tokens. Password tokens resolve only from the local workstation secret store and must be written only to ignored render targets.
 
-Render targets must be ignored by Git. The tool writes them with mode `0600`, replaces its prior managed block, and removes variables named by the optional purge column.
+Render targets must be ignored by Git. The tool writes them with mode `0600`, replaces its prior managed block, and removes variables named by the optional purge column. `doctor` uses the same expected-content computation as `render` and fails when managed output is stale. Unmanaged comments and assignments permitted by the managed-block rules remain intact and do not cause a stale result.
 
 ## Compatibility
 
