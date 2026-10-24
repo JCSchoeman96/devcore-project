@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import pwd
 import re
 import signal
 import shutil
@@ -75,6 +76,13 @@ class DevCoreProjectFixture(unittest.TestCase):
             "DEVCORE_SECRETS_FILE": str(self.secrets),
             "DEVCORE_PROJECT_CONF": ".devcore/project.conf",
         }
+
+    def mutation_lock_path(self, state_path):
+        path = Path(state_path)
+        canonical = path.parent.resolve(strict=False) / path.name
+        digest = hashlib.sha256(os.fsencode(str(canonical))).hexdigest()
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        return account_home / ".config" / "dev-core" / "locks" / f"state-{digest}.lock"
 
     def run_tool(self, *args, env=None):
         child_env = self.env()
@@ -343,7 +351,7 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             self.assertTrue(entered.exists(), "first activation did not pause after locking the store")
             self.assertFalse(fresh_secrets.exists())
             initial_names = {path.name for path in fresh_central.iterdir()}
-            self.assertEqual(initial_names, {".devcore-project.lock", "dev-core.conf"})
+            self.assertEqual(initial_names, {"dev-core.conf"})
             conf_before = fresh_global.read_bytes()
 
             install = self.run_tool("install", env=mock_env)
@@ -373,33 +381,159 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
         for line in fresh_secrets.read_text().splitlines():
             self.assertNotIn(line.split("=", 1)[1], stdout + stderr)
 
-    def test_independent_config_roots_cannot_share_a_secret_file(self):
-        roots = [self.root / "central-one", self.root / "central-two"]
-        for override_name, filename in (
-            ("DEVCORE_SECRETS_FILE", "project-db.env"),
-            ("DEVCORE_GLOBAL_CONF", "dev-core.conf"),
-        ):
-            with self.subTest(override=override_name):
-                shared_state = self.root / f"shared-{filename}"
-                shared_state.write_text("SENTINEL=preserve-me\n")
-                shared_state.chmod(0o600)
-                before = shared_state.read_bytes()
+    def test_arbitrary_state_file_overrides_are_accepted_and_share_locks(self):
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
 
-                for root in roots:
-                    env = self.env()
-                    env.update(
-                        {
-                            "DEVCORE_CONFIG_DIR": str(root),
-                            "DEVCORE_GLOBAL_CONF": str(root / "dev-core.conf"),
-                            "DEVCORE_SECRETS_FILE": str(root / "project-db.env"),
-                        }
-                    )
-                    env[override_name] = str(shared_state)
-                    result = self.run_tool("activate", env=env)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(override_name, result.stderr)
-                    self.assertFalse(root.exists())
-                    self.assertEqual(shared_state.read_bytes(), before)
+        for shared_name in ("DEVCORE_SECRETS_FILE", "DEVCORE_GLOBAL_CONF"):
+            with self.subTest(shared_path=shared_name):
+                first_central = self.root / f"central-one-{shared_name}"
+                second_central = self.root / f"central-two-{shared_name}"
+                shared_state = self.root / f"external-{shared_name}"
+                shared_state.parent.mkdir(parents=True, exist_ok=True)
+                if shared_name == "DEVCORE_SECRETS_FILE":
+                    first_secrets = second_secrets = shared_state
+                    first_global = first_central / "external-global.conf"
+                    second_global = second_central / "external-global.conf"
+                else:
+                    first_global = second_global = shared_state
+                    first_secrets = first_central / "external-secrets.env"
+                    second_secrets = second_central / "external-secrets.env"
+
+                entered = self.root / f"entered-{shared_name}"
+                release = self.root / f"release-{shared_name}"
+                mock_bin = self.root / f"mock-bin-{shared_name}"
+                mock_bin.mkdir()
+                chmod = mock_bin / "chmod"
+                chmod.write_text(
+                    "#!/bin/sh\n"
+                    f"if [ \"${{2-}}\" = {str(first_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+                    f"  : > {str(entered)!r}\n"
+                    f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+                    "fi\n"
+                    f"exec {real_chmod} \"$@\"\n"
+                )
+                chmod.chmod(0o700)
+
+                first_env = self.env()
+                first_env.update(
+                    {
+                        "PATH": str(mock_bin) + os.pathsep + os.environ["PATH"],
+                        "DEVCORE_CONFIG_DIR": str(first_central),
+                        "DEVCORE_GLOBAL_CONF": str(first_global),
+                        "DEVCORE_SECRETS_FILE": str(first_secrets),
+                    }
+                )
+                second_env = self.env()
+                second_env.update(
+                    {
+                        "DEVCORE_CONFIG_DIR": str(second_central),
+                        "DEVCORE_GLOBAL_CONF": str(second_global),
+                        "DEVCORE_SECRETS_FILE": str(second_secrets),
+                    }
+                )
+
+                first = self.start_tool("install", env=first_env)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not entered.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(entered.exists(), "first install did not hold its state locks")
+                    self.assertFalse(shared_state.exists())
+
+                    second = self.run_tool("install", env=second_env)
+                    self.assertNotEqual(second.returncode, 0)
+                    self.assertIn("mutation lock", second.stderr)
+                    self.assertFalse(second_central.exists())
+                    self.assertFalse(shared_state.exists())
+                finally:
+                    release.touch()
+                    first_stdout, first_stderr = first.communicate(timeout=10)
+
+                self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+                self.assertTrue(shared_state.exists())
+                self.assertEqual(shared_state.stat().st_mode & 0o777, 0o600)
+                self.assertTrue(first_central.exists())
+                self.assertFalse(second_central.exists())
+
+                first_secrets.write_text(
+                    f"DEMO_DEV_DB_PASSWORD={DEV_PASSWORD}\n"
+                    f"DEMO_TEST_DB_PASSWORD={TEST_PASSWORD}\n"
+                )
+                first_secrets.chmod(0o600)
+                rendered = self.run_tool("render", env=first_env)
+                self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                self.assertIn("DEV_DATABASE_HOST=127.0.0.1", (self.project / ".env.dev").read_text())
+                self.assertIn("TEST_DATABASE_HOST=127.0.0.1", (self.project / ".env.test").read_text())
+                self.assertNotIn(DEV_PASSWORD, rendered.stdout + rendered.stderr)
+                self.assertNotIn(TEST_PASSWORD, rendered.stdout + rendered.stderr)
+
+    def test_equivalent_state_paths_use_the_same_mutation_lock(self):
+        shared_dir = self.root / "normalized-shared"
+        shared_dir.mkdir()
+        shared_secret = shared_dir / "secrets.env"
+        alias_dir = self.root / "normalized-alias"
+        alias_dir.symlink_to(shared_dir, target_is_directory=True)
+        alias_secret = alias_dir / "nested" / ".." / "secrets.env"
+        first_central = self.root / "normalized-central-one"
+        second_central = self.root / "normalized-central-two"
+        lock_one = self.mutation_lock_path(shared_secret)
+        lock_two = self.mutation_lock_path(alias_secret)
+        self.assertEqual(lock_one, lock_two)
+
+        real_chmod = shutil.which("chmod")
+        self.assertIsNotNone(real_chmod)
+        entered = self.root / "normalized-entered"
+        release = self.root / "normalized-release"
+        mock_bin = self.root / "normalized-mock-bin"
+        mock_bin.mkdir()
+        chmod = mock_bin / "chmod"
+        chmod.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{2-}}\" = {str(first_central)!r} ] && [ ! -e {str(entered)!r} ]; then\n"
+            f"  : > {str(entered)!r}\n"
+            f"  while [ ! -e {str(release)!r} ]; do sleep 0.01; done\n"
+            "fi\n"
+            f"exec {real_chmod} \"$@\"\n"
+        )
+        chmod.chmod(0o700)
+
+        first_env = self.env()
+        first_env.update(
+            {
+                "PATH": str(mock_bin) + os.pathsep + os.environ["PATH"],
+                "DEVCORE_CONFIG_DIR": str(first_central),
+                "DEVCORE_GLOBAL_CONF": str(first_central / "global.conf"),
+                "DEVCORE_SECRETS_FILE": str(shared_secret),
+            }
+        )
+        second_env = self.env()
+        second_env.update(
+            {
+                "DEVCORE_CONFIG_DIR": str(second_central),
+                "DEVCORE_GLOBAL_CONF": str(second_central / "global.conf"),
+                "DEVCORE_SECRETS_FILE": str(alias_secret),
+            }
+        )
+
+        first = self.start_tool("install", env=first_env)
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first install did not hold its state locks")
+            second = self.run_tool("install", env=second_env)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("mutation lock", second.stderr)
+            self.assertFalse(shared_secret.exists())
+            self.assertFalse(second_central.exists())
+        finally:
+            release.touch()
+            first_stdout, first_stderr = first.communicate(timeout=10)
+
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+        self.assertTrue(shared_secret.exists())
+        self.assertEqual(shared_secret.stat().st_mode & 0o777, 0o600)
 
     def test_mutation_lock_is_released_when_owner_process_dies(self):
         self._start_database_endpoints()
@@ -558,7 +692,8 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             self.assertNotIn(value, stdout + stderr + retry.stdout + retry.stderr + log_text)
 
     def test_mutation_lock_rejects_symlink_and_unsafe_mode(self):
-        lock = self.central / ".devcore-project.lock"
+        lock = self.mutation_lock_path(self.secrets)
+        lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = self.root / "outside-lock"
         target.write_text("unchanged\n")
         lock.symlink_to(target)
@@ -1113,10 +1248,7 @@ class DevCoreBaselineTests(DevCoreProjectFixture):
             self.assertTrue(entered.exists(), "first install did not hold the lock during initialization")
             self.assertFalse(fresh_global.exists())
             self.assertFalse(fresh_secrets.exists())
-            self.assertEqual(
-                {path.name for path in fresh_central.iterdir()},
-                {".devcore-project.lock"},
-            )
+            self.assertEqual({path.name for path in fresh_central.iterdir()}, set())
             second = self.run_tool("install", env=env)
             self.assertNotEqual(second.returncode, 0)
             self.assertIn("mutation lock", second.stderr)

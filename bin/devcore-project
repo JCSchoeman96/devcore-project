@@ -7,8 +7,13 @@ VERSION="1.1.0"
 PROGRAM="devcore-project"
 
 CENTRAL_DIR="${DEVCORE_CONFIG_DIR:-$HOME/.config/dev-core}"
-CENTRAL_SECRETS="${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}"
-GLOBAL_CONF="${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}"
+if [[ -n "${DEVCORE_MUTATION_LOCK_FDS:-}" ]]; then
+  CENTRAL_SECRETS="${DEVCORE_MUTATION_SECRETS_PATH:-${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}}"
+  GLOBAL_CONF="${DEVCORE_MUTATION_GLOBAL_CONF_PATH:-${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}}"
+else
+  CENTRAL_SECRETS="${DEVCORE_SECRETS_FILE:-$CENTRAL_DIR/project-db.env}"
+  GLOBAL_CONF="${DEVCORE_GLOBAL_CONF:-$CENTRAL_DIR/dev-core.conf}"
+fi
 PROJECT_CONF="${DEVCORE_PROJECT_CONF:-.devcore/project.conf}"
 
 log()  { printf '%s\n' "$*" >&2; }
@@ -70,8 +75,8 @@ Commands:
 
 Environment overrides:
   DEVCORE_CONFIG_DIR
-  DEVCORE_SECRETS_FILE (must be project-db.env inside DEVCORE_CONFIG_DIR)
-  DEVCORE_GLOBAL_CONF (must be dev-core.conf inside DEVCORE_CONFIG_DIR)
+  DEVCORE_SECRETS_FILE
+  DEVCORE_GLOBAL_CONF
   DEVCORE_PROJECT_CONF
 USAGE
 }
@@ -151,18 +156,30 @@ validate_state_paths() {
 import os, stat, sys
 from pathlib import Path
 
+def normalized_state_path(raw):
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.name or path.name in (".", ".."):
+        raise RuntimeError("central state file path must name a file")
+    canonical = path.parent.resolve(strict=False) / path.name
+    try:
+        entry = canonical.lstat()
+    except FileNotFoundError:
+        entry = None
+    if entry is not None and stat.S_ISLNK(entry.st_mode):
+        raise RuntimeError(f"central state file must not be a symlink: {canonical}")
+    return canonical
+
 central = Path(sys.argv[1]).expanduser()
-secrets = Path(sys.argv[2]).expanduser()
-global_conf = Path(sys.argv[3]).expanduser()
 canonical_dir = Path(os.path.abspath(os.path.normpath(central)))
-expected = {
-    "DEVCORE_SECRETS_FILE": Path(os.path.abspath(canonical_dir / "project-db.env")),
-    "DEVCORE_GLOBAL_CONF": Path(os.path.abspath(canonical_dir / "dev-core.conf")),
-}
-for name, path in (("DEVCORE_SECRETS_FILE", secrets), ("DEVCORE_GLOBAL_CONF", global_conf)):
-    actual = Path(os.path.abspath(os.path.normpath(path)))
-    if actual != expected[name]:
-        raise SystemExit(f"ERROR: {name} must be the canonical file inside DEVCORE_CONFIG_DIR")
+try:
+    secrets = normalized_state_path(sys.argv[2])
+    global_conf = normalized_state_path(sys.argv[3])
+except (OSError, RuntimeError) as error:
+    raise SystemExit(f"ERROR: {error}")
+if secrets == global_conf:
+    raise SystemExit("ERROR: DEVCORE_SECRETS_FILE and DEVCORE_GLOBAL_CONF must identify different files")
 
 try:
     directory = canonical_dir.lstat()
@@ -174,7 +191,7 @@ if directory is not None:
     if directory.st_uid != os.getuid() or stat.S_IMODE(directory.st_mode) != 0o700:
         raise SystemExit("ERROR: central config directory must be owned by this user with mode 0700")
 
-for path in (expected["DEVCORE_SECRETS_FILE"], expected["DEVCORE_GLOBAL_CONF"]):
+for path in (secrets, global_conf):
     try:
         entry = path.lstat()
     except FileNotFoundError:
@@ -185,6 +202,18 @@ for path in (expected["DEVCORE_SECRETS_FILE"], expected["DEVCORE_GLOBAL_CONF"]):
         raise SystemExit(f"ERROR: central state file must be owned by this user with mode 0600: {path}")
     if entry.st_nlink != 1:
         raise SystemExit(f"ERROR: central state file must not have additional hard links: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise SystemExit(f"ERROR: cannot safely open central state file {path}: {error}")
+    try:
+        opened = os.fstat(fd)
+        current = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit(f"ERROR: central state file changed during validation: {path}")
+    finally:
+        os.close(fd)
 ' "$CENTRAL_DIR" "$CENTRAL_SECRETS" "$GLOBAL_CONF"
 }
 
@@ -195,9 +224,8 @@ write_global_defaults() {
 import os, stat, sys, tempfile
 from pathlib import Path
 
-directory = Path(sys.argv[1]).expanduser()
-global_conf = Path(sys.argv[2]).expanduser()
-secrets = Path(sys.argv[3]).expanduser()
+global_conf = Path(sys.argv[1]).expanduser()
+secrets = Path(sys.argv[2]).expanduser()
 global_body = b"""# dev-core workstation endpoints. Non-secret.
 PG_DEV_HOST=127.0.0.1
 PG_DEV_PORT=55432
@@ -228,9 +256,10 @@ def validate(path):
     return True
 
 def create_if_absent(path, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
     if validate(path):
         return
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(body)
@@ -242,7 +271,7 @@ def create_if_absent(path, body):
         except FileExistsError:
             if not validate(path):
                 raise RuntimeError(f"central state file disappeared during initialization: {path}")
-        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
         finally:
@@ -253,7 +282,7 @@ def create_if_absent(path, body):
 
 create_if_absent(global_conf, global_body)
 create_if_absent(secrets, b"")
-' "$CENTRAL_DIR" "$GLOBAL_CONF" "$CENTRAL_SECRETS"
+' "$GLOBAL_CONF" "$CENTRAL_SECRETS"
 }
 
 load_global() {
@@ -1030,88 +1059,156 @@ os.execvpe(cmd[0],cmd,env)
 ' "$profile" "$RENDER_MAP" "${SUPPLEMENTAL_SECRETS:-}" "$CENTRAL_SECRETS" "$@"
 }
 
-acquire_mutation_lock() {
-  python3 -c '
-import fcntl, os, stat, sys
+mutation_lock_helper() {
+  python3 - "$@" <<'PY'
+import fcntl
+import hashlib
+import os
+import pwd
+import stat
+import sys
 from pathlib import Path
 
-central = Path(sys.argv[1]).expanduser()
-script = str(Path(sys.argv[2]).resolve(strict=True))
-command = sys.argv[3]
-args = sys.argv[4:]
-directory_fd = -1
-fd = -1
-try:
-    central.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
-    directory_fd = os.open(central, directory_flags)
-    parent = os.fstat(directory_fd)
-    if not stat.S_ISDIR(parent.st_mode):
-        raise RuntimeError("central config path must be a real directory")
-    if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
-        raise RuntimeError("central config directory must be owned by this user with mode 0700")
+action = sys.argv[1]
+uid = os.getuid()
 
-    flags = os.O_CREAT | os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    lock_name = ".devcore-project.lock"
-    fd = os.open(lock_name, flags, 0o600, dir_fd=directory_fd)
-    lock = os.fstat(fd)
-    current = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
-    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(lock.st_mode):
-        raise RuntimeError("mutation lock must be a regular file, not a symlink")
-    if (lock.st_dev, lock.st_ino) != (current.st_dev, current.st_ino):
-        raise RuntimeError("mutation lock changed during validation")
-    if lock.st_uid != os.getuid() or stat.S_IMODE(lock.st_mode) != 0o600:
-        raise RuntimeError("mutation lock must be owned by this user with mode 0600")
+def normalized_state_path(raw):
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.name or path.name in (".", ".."):
+        raise RuntimeError("central state file path must name a file")
+    canonical = path.parent.resolve(strict=False) / path.name
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise RuntimeError("another DevCore mutation holds the workstation lock")
-    os.close(directory_fd)
-    directory_fd = -1
-    os.set_inheritable(fd, True)
-    os.environ["DEVCORE_MUTATION_LOCK_FD"] = str(fd)
-    os.execv(script, [script, command, *args])
-except (OSError, RuntimeError) as error:
+        entry = canonical.lstat()
+    except FileNotFoundError:
+        entry = None
+    if entry is not None and stat.S_ISLNK(entry.st_mode):
+        raise RuntimeError(f"central state file must not be a symlink: {canonical}")
+    return canonical
+
+def state_paths(secret_raw, global_raw):
+    secret_path = normalized_state_path(secret_raw)
+    global_path = normalized_state_path(global_raw)
+    if secret_path == global_path:
+        raise RuntimeError("DEVCORE_SECRETS_FILE and DEVCORE_GLOBAL_CONF must identify different files")
+    return secret_path, global_path
+
+def lock_name(path):
+    digest = hashlib.sha256(os.fsencode(str(path))).hexdigest()
+    return f"state-{digest}.lock"
+
+def ensure_lock_directory():
+    home = Path(pwd.getpwuid(uid).pw_dir)
+    config = home / ".config"
+    devcore = config / "dev-core"
+    lock_dir = devcore / "locks"
+    chain = ((home, None), (config, None), (devcore, 0o700), (lock_dir, 0o700))
+    for path, required_mode in chain:
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            if path == home:
+                raise RuntimeError("account home directory is missing")
+            try:
+                path.mkdir(mode=required_mode or 0o700)
+            except FileExistsError:
+                pass
+            entry = path.lstat()
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise RuntimeError("DevCore mutation lock directory path must contain only real directories")
+        if entry.st_uid != uid:
+            raise RuntimeError("DevCore mutation lock directories must be owned by this user")
+        if required_mode is not None and stat.S_IMODE(entry.st_mode) != required_mode:
+            raise RuntimeError("DevCore mutation lock directories must have mode 0700")
+        if path in (home, config) and stat.S_IMODE(entry.st_mode) & 0o022:
+            raise RuntimeError("DevCore mutation lock parent directories must not be group- or world-writable")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(lock_dir, flags)
+    opened = os.fstat(directory_fd)
+    current = lock_dir.lstat()
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        os.close(directory_fd)
+        raise RuntimeError("DevCore mutation lock directory changed during validation")
+    return lock_dir, directory_fd
+
+def validate_lock_file(directory_fd, name, fd):
+    opened = os.fstat(fd)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        raise RuntimeError("mutation lock file disappeared during validation")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(opened.st_mode):
+        raise RuntimeError("mutation lock must be a regular file, not a symlink")
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise RuntimeError("mutation lock changed during validation")
+    if opened.st_uid != uid or stat.S_IMODE(opened.st_mode) != 0o600:
+        raise RuntimeError("mutation lock must be owned by this user with mode 0600")
+    if opened.st_nlink != 1:
+        raise RuntimeError("mutation lock must not have additional hard links")
+
+try:
+    secrets, global_conf = state_paths(sys.argv[2], sys.argv[3])
+    names = [(lock_name(secrets), secrets), (lock_name(global_conf), global_conf)]
+    names.sort(key=lambda item: item[0])
+    lock_dir, directory_fd = ensure_lock_directory()
+
+    if action == "acquire":
+        script = str(Path(sys.argv[4]).resolve(strict=True))
+        command = sys.argv[5]
+        args = sys.argv[6:]
+        descriptors = []
+        try:
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            for name, _path in names:
+                fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+                descriptors.append(fd)
+                validate_lock_file(directory_fd, name, fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise RuntimeError("another DevCore mutation holds a state lock")
+
+            os.close(directory_fd)
+            directory_fd = -1
+            for fd in descriptors:
+                os.set_inheritable(fd, True)
+            os.environ["DEVCORE_MUTATION_LOCK_FDS"] = ",".join(str(fd) for fd in descriptors)
+            os.environ["DEVCORE_MUTATION_SECRETS_PATH"] = str(secrets)
+            os.environ["DEVCORE_MUTATION_GLOBAL_CONF_PATH"] = str(global_conf)
+            os.execv(script, [script, command, *args])
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+            for fd in descriptors:
+                os.close(fd)
+    elif action == "validate":
+        descriptors = [int(value) for value in os.environ["DEVCORE_MUTATION_LOCK_FDS"].split(",")]
+        if len(descriptors) != len(names):
+            raise RuntimeError("inherited mutation lock descriptor count is invalid")
+        for (name, _path), fd in zip(names, descriptors):
+            validate_lock_file(directory_fd, name, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    else:
+        raise RuntimeError("unknown mutation lock helper action")
+except (OSError, RuntimeError, ValueError, KeyError, IndexError) as error:
+    if action == "validate":
+        raise SystemExit(f"ERROR: invalid inherited mutation lock: {error}")
     raise SystemExit(f"ERROR: cannot acquire mutation lock: {error}")
 finally:
-    if directory_fd >= 0:
+    if "directory_fd" in locals() and directory_fd >= 0:
         os.close(directory_fd)
-    if fd >= 0:
-        os.close(fd)
-' "$CENTRAL_DIR" "$0" "$1" "${@:2}"
+PY
+}
+
+acquire_mutation_lock() {
+  mutation_lock_helper acquire "$CENTRAL_SECRETS" "$GLOBAL_CONF" "$0" "$1" "${@:2}"
   exit $?
 }
 
 validate_inherited_mutation_lock() {
-  python3 -c '
-import fcntl, os, stat, sys
-from pathlib import Path
-
-central = Path(sys.argv[1]).expanduser()
-try:
-    fd = int(os.environ["DEVCORE_MUTATION_LOCK_FD"])
-    parent = central.lstat()
-    lock_path = central / ".devcore-project.lock"
-    lock = os.fstat(fd)
-    current = lock_path.lstat()
-    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-        raise RuntimeError("central config path must be a real directory")
-    if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
-        raise RuntimeError("central config directory must be owned by this user with mode 0700")
-    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(lock.st_mode):
-        raise RuntimeError("mutation lock must be a regular file, not a symlink")
-    if (lock.st_dev, lock.st_ino) != (current.st_dev, current.st_ino):
-        raise RuntimeError("inherited mutation lock descriptor does not match the lock file")
-    if lock.st_uid != os.getuid() or stat.S_IMODE(lock.st_mode) != 0o600:
-        raise RuntimeError("mutation lock must be owned by this user with mode 0600")
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except (OSError, RuntimeError, ValueError, KeyError) as error:
-    raise SystemExit(f"ERROR: invalid inherited mutation lock: {error}")
-' "$CENTRAL_DIR"
+  mutation_lock_helper validate "$CENTRAL_SECRETS" "$GLOBAL_CONF"
 }
 
 cmd_init() {
@@ -1207,7 +1304,7 @@ main() {
   esac
   case "$cmd" in
     install|activate|rotate|render)
-      if [[ -n "${DEVCORE_MUTATION_LOCK_FD:-}" ]]; then
+      if [[ -n "${DEVCORE_MUTATION_LOCK_FDS:-}" ]]; then
         validate_inherited_mutation_lock
       else
         acquire_mutation_lock "$cmd" "$@"
